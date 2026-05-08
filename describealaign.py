@@ -1,4 +1,4 @@
-__version__ = '3.0.0'
+__version__ = '3.1.0'
 
 # combines videos with matching audio files (e.g. audio descriptions)
 # input: video or folder of videos and an audio file or folder of audio files
@@ -232,12 +232,32 @@ def plot_alignment(plot_filename_no_ext, path, audio_times, video_times, similar
   )
   stable_fraction_pct = (100. * stable_dur / total_dur) if total_dur > 0 else 0.
 
+  this_script_path = os.path.abspath(__file__)
+  version_hash = get_version_hash(this_script_path)
+  video_offset = video_times[0] - audio_times[0]
+
+  def str_from_time(seconds):
+    minutes, seconds = divmod(seconds, 60)
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours:2.0f}:{minutes:02.0f}:{seconds:06.3f}"
+
+  # Both the .txt and .json reports are rendered from the same in-memory
+  # structure, so consumers picking either format see identical numbers.
+  segment_records = []
+  for i in range(len(video_times) - 1):
+    slope = (video_times[i+1] - video_times[i]) / (audio_times[i+1] - audio_times[i])
+    segment_records.append({
+      "rate_pct": (slope - 1.) * 100.,
+      "video_start_sec": float(video_times[i]),
+      "video_end_sec": float(video_times[i + 1]),
+      "audio_start_sec": float(audio_times[i]),
+      "audio_end_sec": float(audio_times[i + 1]),
+    })
+
   with open(plot_filename_no_ext + '.txt', 'w') as file:
     parameters = {'stretch_audio':stretch_audio, 'no_pitch_correction':no_pitch_correction}
     print(f"Parameters: {parameters}", file=file)
-    this_script_path = os.path.abspath(__file__)
-    print(f"Version Hash: {get_version_hash(this_script_path)}", file=file)
-    video_offset = video_times[0] - audio_times[0]
+    print(f"Version Hash: {version_hash}", file=file)
     print(f"Input file similarity: {similarity_percent:.2f}%", file=file)
     # Stable Trunk Fraction: fraction of total runtime in segments whose rate
     # sits within STABLE_RATE_TOLERANCE_PP of the median. PAL/NTSC sources
@@ -247,15 +267,28 @@ def plot_alignment(plot_filename_no_ext, path, audio_times, video_times, similar
     print("Main changes needed to video to align it to audio input:", file=file)
     print(f"Start Offset: {-video_offset:.2f} seconds", file=file)
     print(f"Median Rate Change: {median_rate_pct:.2f}%", file=file)
-    def str_from_time(seconds):
-      minutes, seconds = divmod(seconds, 60)
-      hours, minutes = divmod(minutes, 60)
-      return f"{hours:2.0f}:{minutes:02.0f}:{seconds:06.3f}"
-    for i in range(len(video_times) - 1):
-      slope = (video_times[i+1] - video_times[i]) / (audio_times[i+1] - audio_times[i])
-      print(f"Rate change of {(slope-1.)*100:8.1f}% from {str_from_time(video_times[i])} to " + \
-            f"{str_from_time(video_times[i+1])} aligning with audio from " + \
-            f"{str_from_time(audio_times[i])} to {str_from_time(audio_times[i+1])}", file=file)
+    for seg in segment_records:
+      print(f"Rate change of {seg['rate_pct']:8.1f}% from {str_from_time(seg['video_start_sec'])} to " + \
+            f"{str_from_time(seg['video_end_sec'])} aligning with audio from " + \
+            f"{str_from_time(seg['audio_start_sec'])} to {str_from_time(seg['audio_end_sec'])}", file=file)
+
+  # JSON twin of the .txt report. Same numbers, parseable without regex.
+  json_report = {
+    "version": __version__,
+    "version_hash": version_hash,
+    "parameters": {
+      "stretch_audio": stretch_audio,
+      "no_pitch_correction": no_pitch_correction,
+    },
+    "similarity_pct": float(similarity_percent),
+    "stable_trunk_fraction_pct": float(stable_fraction_pct),
+    "median_rate_pct": float(median_rate_pct),
+    "start_offset_sec": float(-video_offset),
+    "segments": segment_records,
+  }
+  import json as _json
+  with open(plot_filename_no_ext + '.json', 'w') as file:
+    _json.dump(json_report, file, indent=2)
 
 # use the smooth alignment to replace runs of video sound with corresponding described audio
 def replace_aligned_segments(video_arr, audio_desc_arr, audio_desc_times, video_times, no_pitch_correction):
