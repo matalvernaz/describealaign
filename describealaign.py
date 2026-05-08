@@ -1,4 +1,4 @@
-__version__ = '3.1.0'
+__version__ = '3.2.0'
 
 # combines videos with matching audio files (e.g. audio descriptions)
 # input: video or folder of videos and an audio file or folder of audio files
