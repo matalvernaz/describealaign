@@ -1,4 +1,4 @@
-__version__ = '3.2.0'
+__version__ = '3.3.0'
 
 # combines videos with matching audio files (e.g. audio descriptions)
 # input: video or folder of videos and an audio file or folder of audio files
@@ -41,6 +41,37 @@ MIN_STRETCH_OFFSET = 30
 # streaming-source video produces audible "AD voice → raw episode audio →
 # AD voice" pop transitions at every commercial-break seam.
 SEAM_CROSSFADE_SECONDS = 0.2
+
+# Known framerate-conversion targets for the duration-ratio prior. The pair
+# is (audio_dur / video_dur, "name"). Tolerance is intentionally tight —
+# 0.05% — so a video whose AD has commercial-break-induced length surplus
+# can't be misclassified as a framerate conversion.
+#
+# Only PAL↔NTSC magnitudes (~4%) are listed: the smaller 23.976↔24 ratios
+# (~0.1%) are handled fine by the existing slope estimation and don't need
+# a prior.
+_FRAMERATE_CONVERSION_TARGETS = (
+    (25.0 / 23.976, "NTSC video ↔ PAL AD"),
+    (23.976 / 25.0, "PAL video ↔ NTSC AD"),
+    (25.0 / 24.0,   "24fps video ↔ PAL AD"),
+    (24.0 / 25.0,   "PAL video ↔ 24fps AD"),
+)
+_FRAMERATE_RATIO_TOLERANCE = 0.0005
+
+
+def detect_framerate_conversion(audio_video_duration_ratio):
+  """
+  Classify a duration ratio as a known framerate conversion.
+
+  Returns ``(ideal_ratio, name)`` if the input matches one of the known
+  PAL↔NTSC targets within ``_FRAMERATE_RATIO_TOLERANCE``; otherwise
+  ``(None, None)``. The returned ratio is the *exact* mathematical target,
+  not the noisy input — so the subsequent resample compensates exactly.
+  """
+  for target, name in _FRAMERATE_CONVERSION_TARGETS:
+    if abs(audio_video_duration_ratio - target) <= _FRAMERATE_RATIO_TOLERANCE:
+      return target, name
+  return None, None
 
 if PLOT_ALIGNMENT_TO_FILE:
   import matplotlib.pyplot as plt
@@ -168,8 +199,33 @@ def parse_audio_from_file(media_file, num_channels=2):
   media_arr = np.frombuffer(media_stream, np.int16).astype(np.float32).reshape((-1, num_channels)).T
   return media_arr
 
+def probe_duration_seconds(media_file):
+  """Total playback duration of *media_file* in seconds (preferring the
+  video stream when present, falling back to the audio stream, then to the
+  container).
+
+  Returns 0.0 on probe failure rather than raising — pre-resample detection
+  treats "unknown duration" as "skip the heuristic", which is the safe
+  fallback (the existing alignment still runs)."""
+  try:
+    probe = ffmpeg.probe(media_file, cmd=get_ffprobe())
+  except Exception:
+    return 0.0
+  format_dur = probe.get('format', {}).get('duration')
+  for codec_kind in ('video', 'audio'):
+    for stream in probe.get('streams', []):
+      if stream.get('codec_type') == codec_kind and stream.get('duration'):
+        try:
+          return float(stream['duration'])
+        except (TypeError, ValueError):
+          pass
+  try:
+    return float(format_dur) if format_dur else 0.0
+  except (TypeError, ValueError):
+    return 0.0
+
 def plot_alignment(plot_filename_no_ext, path, audio_times, video_times, similarity_percent,
-                   median_slope, stretch_audio, no_pitch_correction):
+                   median_slope, stretch_audio, no_pitch_correction, pre_resample_info=None):
   downsample = 20
   path = path[::downsample]
   video_times_full, audio_times_full, cluster_indices, quals, cum_quals = path.T
@@ -264,6 +320,13 @@ def plot_alignment(plot_filename_no_ext, path, audio_times, video_times, similar
     # (whose pitch shift drags the similarity score down) score ~99% here,
     # making this the cleaner signal for "alignment is structurally correct".
     print(f"Stable Trunk Fraction: {stable_fraction_pct:.2f}%", file=file)
+    if pre_resample_info is not None:
+      # Surface the pre-resample so users (and describarr's diagnostics)
+      # know the alignment ran on a corrected AD instead of the raw input.
+      print(f"Pre-resample: {pre_resample_info['name']} "
+            f"(input ratio {pre_resample_info['input_duration_ratio']:.5f}, "
+            f"applied factor {pre_resample_info['applied_factor']:.5f})",
+            file=file)
     print("Main changes needed to video to align it to audio input:", file=file)
     print(f"Start Offset: {-video_offset:.2f} seconds", file=file)
     print(f"Median Rate Change: {median_rate_pct:.2f}%", file=file)
@@ -284,6 +347,7 @@ def plot_alignment(plot_filename_no_ext, path, audio_times, video_times, similar
     "stable_trunk_fraction_pct": float(stable_fraction_pct),
     "median_rate_pct": float(median_rate_pct),
     "start_offset_sec": float(-video_offset),
+    "pre_resample": pre_resample_info,
     "segments": segment_records,
   }
   import json as _json
@@ -1165,7 +1229,8 @@ def align(video_features, audio_desc_features, video_energy, audio_desc_energy):
 # combines videos with matching audio files (e.g. audio descriptions)
 # this is the main function of this script, it calls the other functions in order
 def combine(video, audio, stretch_audio=False, yes=False, prepend="ad_", no_pitch_correction=False,
-            output_dir=default_output_dir, alignment_dir=default_alignment_dir, dry_run=False):
+            output_dir=default_output_dir, alignment_dir=default_alignment_dir, dry_run=False,
+            pre_resample=True):
   video_files, has_audio_extensions = get_sorted_filenames(video, VIDEO_EXTENSIONS, AUDIO_EXTENSIONS)
   
   if yes == False and sum(has_audio_extensions) > 0:
@@ -1252,6 +1317,47 @@ def combine(video, audio, stretch_audio=False, yes=False, prepend="ad_", no_pitc
     audio_desc_arr = parse_audio_from_file(audio_desc_file, num_channels)
     print(f"  read audio ({time.monotonic() - _t:.1f}s)          ")
 
+    # Pre-resample for known framerate conversions. PAL→NTSC content is
+    # famously misclassified by feature-match similarity (the inherited
+    # 4.27% pitch shift drags the score down even when the alignment is
+    # structurally correct). If the AD/video duration ratio matches a
+    # known framerate target within 0.05%, resample the AD to remove the
+    # drift before feature extraction. Polyphase resampling preserves the
+    # waveform shape; the side-effect downward pitch shift is exactly the
+    # right correction for the PAL speed-up artifact.
+    pre_resample_info = None
+    if pre_resample:
+      video_dur = probe_duration_seconds(video_file)
+      audio_dur = probe_duration_seconds(audio_desc_file)
+      if video_dur > 0 and audio_dur > 0:
+        ratio = audio_dur / video_dur
+        target, name = detect_framerate_conversion(ratio)
+        if target is not None:
+          # target = audio_dur / video_dur. New length should be old / target.
+          old_len = audio_desc_arr.shape[1]
+          # Express target as exact rational from the framerate pair to keep
+          # the resample numerically clean. 25/23.976 = 25000/23976.
+          # 25/24 = 25/24. We approximate any other target with a rational
+          # at sub-ppm precision, which is more than enough.
+          from fractions import Fraction
+          frac = Fraction(target).limit_denominator(100000)
+          # Resample so new_len = old_len / target = old_len * down/up
+          # (when target = up/down, slowing audio means up<down).
+          up, down = frac.denominator, frac.numerator
+          new_len = old_len * up // down
+          print(f"  pre-resample: detected {name} (ratio {ratio:.5f} ≈ {target:.5f}); "
+                f"slowing AD by {1/target:.5f}× ({old_len} → {new_len} samples)")
+          audio_desc_arr = scipy.signal.resample_poly(
+              audio_desc_arr, up=up, down=down, axis=1
+          ).astype(np.float32)
+          pre_resample_info = {
+              "name": name,
+              "input_duration_ratio": float(ratio),
+              "applied_factor": float(1 / target),
+              "rational_up": int(up),
+              "rational_down": int(down),
+          }
+
     _t = time.monotonic()
     print("  computing audio features...\r", end='')
     audio_desc_energy = get_energy(audio_desc_arr)
@@ -1320,7 +1426,8 @@ def combine(video, audio, stretch_audio=False, yes=False, prepend="ad_", no_pitc
     if PLOT_ALIGNMENT_TO_FILE:
       plot_filename_no_ext = os.path.join(alignment_dir, os.path.splitext(os.path.split(video_file)[1])[0])
       plot_alignment(plot_filename_no_ext, path, audio_desc_times, video_times, similarity_percent,
-                     median_slope, stretch_audio, no_pitch_correction)
+                     median_slope, stretch_audio, no_pitch_correction,
+                     pre_resample_info=pre_resample_info)
   print("All files processed.       ")
 
 if wx is not None:
@@ -1968,6 +2075,11 @@ def command_line_interface():
                       help='Directory alignment data and plots are saved to. Default is "alignment_plots"')
   parser.add_argument('--dry-run', action='store_true',
                       help='Run alignment and produce plots without writing output media files.')
+  parser.add_argument('--no-pre-resample', action='store_true',
+                      help='Disable PAL/NTSC pre-resample. Default is to detect known framerate '
+                           'conversions (within 0.05%% of an exact target) and resample the AD '
+                           'to remove the drift before feature extraction. Pass this flag to '
+                           'always run on the raw AD.')
   parser.add_argument('--watch', action='store_true',
                       help='Watch input directories for new file pairs and process them automatically.')
   parser.add_argument('--watch-interval', type=int, default=30, metavar='SECONDS',
@@ -2005,12 +2117,14 @@ def command_line_interface():
     os.chmod(get_ffmpeg(), 0o755)
     os.chmod(get_ffprobe(), 0o755)
   elif args.video and args.audio:
+    pre_resample_enabled = not args.no_pre_resample
     if args.watch:
       print(f"Watch mode active, scanning every {args.watch_interval}s. Press Ctrl+C to stop.")
       while True:
         try:
           combine(args.video, args.audio, args.stretch_audio, True, args.prepend,
-                  args.no_pitch_correction, args.output_dir, args.alignment_dir, args.dry_run)
+                  args.no_pitch_correction, args.output_dir, args.alignment_dir, args.dry_run,
+                  pre_resample=pre_resample_enabled)
         except KeyboardInterrupt:
           print("\nWatch mode stopped.")
           break
@@ -2020,7 +2134,8 @@ def command_line_interface():
         time.sleep(args.watch_interval)
     else:
       combine(args.video, args.audio, args.stretch_audio, args.yes, args.prepend,
-              args.no_pitch_correction, args.output_dir, args.alignment_dir, args.dry_run)
+              args.no_pitch_correction, args.output_dir, args.alignment_dir, args.dry_run,
+              pre_resample=pre_resample_enabled)
   else:
     parser.print_usage()
 
