@@ -1,4 +1,4 @@
-__version__ = '2.1.0'
+__version__ = '2.1.1'
 
 # combines videos with matching audio files (e.g. audio descriptions)
 # input: video or folder of videos and an audio file or folder of audio files
@@ -214,6 +214,24 @@ def plot_alignment(plot_filename_no_ext, path, audio_times, video_times, similar
   plt.tight_layout()
   plt.savefig(plot_filename_no_ext + '.png', dpi=400)
   plt.clf()
+  # Compute the per-segment slopes once so we can both write them out and
+  # summarise their stability.
+  segment_rates = []  # (slope_minus_one_pct, dur_seconds)
+  for i in range(len(video_times) - 1):
+    seg_dur = video_times[i + 1] - video_times[i]
+    if seg_dur <= 0:
+      continue
+    slope = (video_times[i + 1] - video_times[i]) / (audio_times[i + 1] - audio_times[i])
+    segment_rates.append(((slope - 1.) * 100., seg_dur))
+
+  median_rate_pct = (median_slope - 1.) * 100.
+  total_dur = sum(d for _, d in segment_rates)
+  STABLE_RATE_TOLERANCE_PP = 0.3
+  stable_dur = sum(
+    d for r, d in segment_rates if abs(r - median_rate_pct) <= STABLE_RATE_TOLERANCE_PP
+  )
+  stable_fraction_pct = (100. * stable_dur / total_dur) if total_dur > 0 else 0.
+
   with open(plot_filename_no_ext + '.txt', 'w') as file:
     parameters = {'stretch_audio':stretch_audio, 'no_pitch_correction':no_pitch_correction}
     print(f"Parameters: {parameters}", file=file)
@@ -221,9 +239,14 @@ def plot_alignment(plot_filename_no_ext, path, audio_times, video_times, similar
     print(f"Version Hash: {get_version_hash(this_script_path)}", file=file)
     video_offset = video_times[0] - audio_times[0]
     print(f"Input file similarity: {similarity_percent:.2f}%", file=file)
+    # Stable Trunk Fraction: fraction of total runtime in segments whose rate
+    # sits within STABLE_RATE_TOLERANCE_PP of the median. PAL/NTSC sources
+    # (whose pitch shift drags the similarity score down) score ~99% here,
+    # making this the cleaner signal for "alignment is structurally correct".
+    print(f"Stable Trunk Fraction: {stable_fraction_pct:.2f}%", file=file)
     print("Main changes needed to video to align it to audio input:", file=file)
     print(f"Start Offset: {-video_offset:.2f} seconds", file=file)
-    print(f"Median Rate Change: {(median_slope-1.)*100:.2f}%", file=file)
+    print(f"Median Rate Change: {median_rate_pct:.2f}%", file=file)
     def str_from_time(seconds):
       minutes, seconds = divmod(seconds, 60)
       hours, minutes = divmod(minutes, 60)
