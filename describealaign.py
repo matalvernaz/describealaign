@@ -1,4 +1,4 @@
-__version__ = '3.5.0'
+__version__ = '3.5.1'
 
 # combines videos with matching audio files (e.g. audio descriptions)
 # input: video or folder of videos and an audio file or folder of audio files
@@ -43,9 +43,19 @@ MIN_STRETCH_OFFSET = 30
 SEAM_CROSSFADE_SECONDS = 0.2
 
 # Known framerate-conversion targets for the duration-ratio prior. The pair
-# is (audio_dur / video_dur, "name"). Tolerance is intentionally tight —
-# 0.05% — so a video whose AD has commercial-break-induced length surplus
-# can't be misclassified as a framerate conversion.
+# is (audio_dur / video_dur, "name").
+#
+# Tolerance is asymmetric. For ratio < 1 (AD shorter than video — the
+# PAL→NTSC direction), the AD can only be SHORTER if it was sped up; AD
+# can't have less content than the video, so commercial-seam surplus
+# (which always makes AD longer) is impossible here. Tolerance is loose
+# (0.5%) to absorb intro/outro length differences and AD source-edit drift.
+#
+# For ratio > 1 (AD longer than video — the NTSC→PAL direction), the
+# unambiguous PAL signal collides with the commercial-seam-surplus
+# pattern (broadcast AD with ad-break content vs streaming video). Keep
+# the tolerance tight (0.05%) so a 90s of seam in a half-hour episode
+# doesn't get misclassified as a framerate conversion.
 #
 # Only PAL↔NTSC magnitudes (~4%) are listed: the smaller 23.976↔24 ratios
 # (~0.1%) are handled fine by the existing slope estimation and don't need
@@ -56,7 +66,8 @@ _FRAMERATE_CONVERSION_TARGETS = (
     (25.0 / 24.0,   "24fps video ↔ PAL AD"),
     (24.0 / 25.0,   "PAL video ↔ 24fps AD"),
 )
-_FRAMERATE_RATIO_TOLERANCE = 0.0005
+_TOLERANCE_RATIO_LT_1 = 0.005
+_TOLERANCE_RATIO_GT_1 = 0.0005
 
 
 class AlignmentMismatchError(RuntimeError):
@@ -141,12 +152,19 @@ def detect_framerate_conversion(audio_video_duration_ratio):
   Classify a duration ratio as a known framerate conversion.
 
   Returns ``(ideal_ratio, name)`` if the input matches one of the known
-  PAL↔NTSC targets within ``_FRAMERATE_RATIO_TOLERANCE``; otherwise
-  ``(None, None)``. The returned ratio is the *exact* mathematical target,
-  not the noisy input — so the subsequent resample compensates exactly.
+  PAL↔NTSC targets within tolerance; otherwise ``(None, None)``. The
+  returned ratio is the *exact* mathematical target, not the noisy input —
+  so the subsequent resample compensates exactly.
+
+  Tolerance is asymmetric (see comment on the targets table): wider for
+  ratio < 1 where the seam-surplus pattern can't reach, tighter for
+  ratio > 1 where it can collide with PAL/NTSC.
   """
+  if audio_video_duration_ratio <= 0:
+    return None, None
+  tol = _TOLERANCE_RATIO_LT_1 if audio_video_duration_ratio < 1.0 else _TOLERANCE_RATIO_GT_1
   for target, name in _FRAMERATE_CONVERSION_TARGETS:
-    if abs(audio_video_duration_ratio - target) <= _FRAMERATE_RATIO_TOLERANCE:
+    if abs(audio_video_duration_ratio - target) <= tol:
       return target, name
   return None, None
 
@@ -351,7 +369,9 @@ def parse_audio_from_file(media_file, num_channels=2, cache_dir=None):
     try:
       os.makedirs(cache_dir, exist_ok=True)
       _evict_until_fits(cache_dir, media_arr.nbytes)
-      tmp = cache_path + '.part'
+      # np.save auto-appends '.npy' if not already present, so the tmp name
+      # must already end in '.npy' to avoid landing at '<hash>.part.npy'.
+      tmp = cache_path + '.tmp.npy'
       np.save(tmp, media_arr)
       os.replace(tmp, cache_path)
     except OSError as exc:
@@ -1501,6 +1521,8 @@ def combine(video, audio, stretch_audio=False, yes=False, prepend="ad_", no_pitc
       if video_dur > 0 and audio_dur > 0:
         ratio = audio_dur / video_dur
         target, name = detect_framerate_conversion(ratio)
+        print(f"  duration ratio: {ratio:.5f} (audio {audio_dur:.1f}s / video {video_dur:.1f}s) "
+              f"→ {name if name else 'no framerate conversion detected'}")
         if target is not None:
           # target = audio_dur / video_dur. New length should be old / target.
           old_len = audio_desc_arr.shape[1]

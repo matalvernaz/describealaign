@@ -41,22 +41,40 @@ def test_rejects_commercial_seam_surplus():
     """A broadcast AD with 4 minutes of commercial-break content baked in,
     against a 90-min commercial-free video, has ratio ≈ 1.044. That's
     close to but DISTINCT from the PAL/NTSC target of 1.04271. The
-    detector must not misclassify it as a framerate conversion."""
+    detector must not misclassify it as a framerate conversion (the
+    ratio>1 tolerance is intentionally tight, 0.05%, to avoid this)."""
     target, name = da.detect_framerate_conversion(1.044)
     assert target is None, \
         "commercial-seam surplus must not be misread as a framerate conversion"
 
 
-def test_accepts_exactly_at_tolerance_edge():
-    """A real-world ratio is rarely exactly 1.04271 — small probe-noise
-    is fine within 0.05%."""
-    target, name = da.detect_framerate_conversion(1.0 / (23.976 / 25.0) + 0.0004)
+def test_accepts_at_ratio_gt_1_tolerance_edge():
+    """For ratio > 1 the tolerance is tight (0.05%)."""
+    target, name = da.detect_framerate_conversion((25.0 / 23.976) + 0.0004)
     assert target is not None
 
 
-def test_rejects_just_outside_tolerance():
-    """One step beyond tolerance should not match."""
+def test_rejects_ratio_gt_1_just_outside_tight_tolerance():
     target, name = da.detect_framerate_conversion((25.0 / 23.976) + 0.001)
+    assert target is None
+
+
+def test_accepts_at_ratio_lt_1_loose_tolerance():
+    """For ratio < 1 the tolerance is loose (0.5%) because commercial-seam
+    surplus can't make AD shorter than video — only intro/outro/source-edit
+    drift can. Real-world example: Buffy AD source includes a 1-2 second
+    intro the streaming video cuts, so ratio drifts a few thousandths of a
+    point below the ideal 0.95904."""
+    # 0.957 — what a Buffy-class AD might look like; outside the old 0.0005
+    # tolerance, inside the new 0.005 tolerance.
+    target, name = da.detect_framerate_conversion(0.957)
+    assert target is not None
+    assert "PAL" in name and "NTSC" in name
+
+
+def test_rejects_ratio_lt_1_just_outside_loose_tolerance():
+    """A ratio of 0.95 — clearly not PAL/NTSC drift — must still reject."""
+    target, name = da.detect_framerate_conversion(0.95)
     assert target is None
 
 
