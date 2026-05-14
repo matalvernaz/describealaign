@@ -173,8 +173,6 @@ def is_passthrough_alignment(audio_desc_times, video_times, median_slope,
   return True
 
 
-if PLOT_ALIGNMENT_TO_FILE:
-  import matplotlib.pyplot as plt
 import time
 import argparse
 from contextlib import redirect_stderr, redirect_stdout
@@ -435,50 +433,59 @@ def parse_audio_from_file(media_file, num_channels=2, cache_dir=None):
 
 def plot_alignment(plot_filename_no_ext, path, audio_times, video_times, similarity_percent,
                    median_slope, stretch_audio, no_pitch_correction):
-  downsample = 20
-  path = path[::downsample]
-  video_times_full, audio_times_full, cluster_indices, quals, cum_quals = path.T
-  scatter_color = [.2,.4,.8]
-  lcs_rgba = np.zeros((len(quals),4))
-  lcs_rgba[:,:3] = np.array(scatter_color)[None,:]
-  lcs_rgba[:,3] = np.clip(quals * 400. / len(quals), 0, 1)
-  audio_offsets = audio_times_full - video_times_full
-  plt.switch_backend('Agg')
-  plt.scatter(video_times_full / 60., audio_offsets, s=3, c=lcs_rgba, label='Matches')
-  audio_offsets = audio_times - video_times
-  def expand_limits(start, end, ratio=.01):
-    average = (end + start) / 2.
-    half_diff = (end - start) / 2.
-    half_diff *= (1 + ratio)
-    return (average - half_diff, average + half_diff)
-  plt.xlim(expand_limits(*(0, np.max(video_times) / 60.)))
-  plt.ylim(expand_limits(*(np.min(audio_offsets) - 10 * TIMESTEP_SIZE_SECONDS,
-                           np.max(audio_offsets) + 10 * TIMESTEP_SIZE_SECONDS), .05))
-  if stretch_audio:
-    plt.plot(video_times / 60., audio_offsets, 'r-', lw=.5, label='Replaced Audio')
-    audio_times_unreplaced = []
-    video_times_unreplaced = []
-    for i in range(len(video_times) - 1):
-      slope = (audio_times[i+1] - audio_times[i]) / (video_times[i+1] - video_times[i])
-      if abs(1 - slope) > MAX_RATE_RATIO_DIFF_ALIGN:
-        video_times_unreplaced.extend(video_times[i:i+2])
-        audio_times_unreplaced.extend(audio_times[i:i+2])
-        video_times_unreplaced.append(video_times[i+1])
-        audio_times_unreplaced.append(np.nan)
-    if len(video_times_unreplaced) > 0:
-      video_times_unreplaced = np.array(video_times_unreplaced)
-      audio_times_unreplaced = np.array(audio_times_unreplaced)
-      audio_offsets = audio_times_unreplaced - video_times_unreplaced
-      plt.plot(video_times_unreplaced / 60., audio_offsets, 'c-', lw=1, label='Original Audio')
-  else:
-    plt.plot(video_times / 60., audio_offsets, 'r-', lw=1, label='Combined Media')
-  plt.xlabel('Original Video Time (minutes)')
-  plt.ylabel('Original Audio Description Offset (seconds behind video)')
-  plt.title(f"Alignment - Media Similarity {similarity_percent:.2f}%")
-  plt.legend().legend_handles[0].set_color(scatter_color)
-  plt.tight_layout()
-  plt.savefig(plot_filename_no_ext + '.png', dpi=400)
-  plt.clf()
+  # Plot rendering is best-effort: if matplotlib isn't installed, skip the
+  # PNG and still write the .txt/.json reports. Lets headless installs
+  # (e.g. inside a server container) get the structured alignment data that
+  # downstream tools depend on without dragging in a GUI toolkit.
+  try:
+    import matplotlib.pyplot as plt
+  except ImportError:
+    plt = None
+  if plt is not None:
+    downsample = 20
+    plot_path = path[::downsample]
+    video_times_full, audio_times_full, cluster_indices, quals, cum_quals = plot_path.T
+    scatter_color = [.2,.4,.8]
+    lcs_rgba = np.zeros((len(quals),4))
+    lcs_rgba[:,:3] = np.array(scatter_color)[None,:]
+    lcs_rgba[:,3] = np.clip(quals * 400. / len(quals), 0, 1)
+    audio_offsets = audio_times_full - video_times_full
+    plt.switch_backend('Agg')
+    plt.scatter(video_times_full / 60., audio_offsets, s=3, c=lcs_rgba, label='Matches')
+    audio_offsets = audio_times - video_times
+    def expand_limits(start, end, ratio=.01):
+      average = (end + start) / 2.
+      half_diff = (end - start) / 2.
+      half_diff *= (1 + ratio)
+      return (average - half_diff, average + half_diff)
+    plt.xlim(expand_limits(*(0, np.max(video_times) / 60.)))
+    plt.ylim(expand_limits(*(np.min(audio_offsets) - 10 * TIMESTEP_SIZE_SECONDS,
+                             np.max(audio_offsets) + 10 * TIMESTEP_SIZE_SECONDS), .05))
+    if stretch_audio:
+      plt.plot(video_times / 60., audio_offsets, 'r-', lw=.5, label='Replaced Audio')
+      audio_times_unreplaced = []
+      video_times_unreplaced = []
+      for i in range(len(video_times) - 1):
+        slope = (audio_times[i+1] - audio_times[i]) / (video_times[i+1] - video_times[i])
+        if abs(1 - slope) > MAX_RATE_RATIO_DIFF_ALIGN:
+          video_times_unreplaced.extend(video_times[i:i+2])
+          audio_times_unreplaced.extend(audio_times[i:i+2])
+          video_times_unreplaced.append(video_times[i+1])
+          audio_times_unreplaced.append(np.nan)
+      if len(video_times_unreplaced) > 0:
+        video_times_unreplaced = np.array(video_times_unreplaced)
+        audio_times_unreplaced = np.array(audio_times_unreplaced)
+        audio_offsets = audio_times_unreplaced - video_times_unreplaced
+        plt.plot(video_times_unreplaced / 60., audio_offsets, 'c-', lw=1, label='Original Audio')
+    else:
+      plt.plot(video_times / 60., audio_offsets, 'r-', lw=1, label='Combined Media')
+    plt.xlabel('Original Video Time (minutes)')
+    plt.ylabel('Original Audio Description Offset (seconds behind video)')
+    plt.title(f"Alignment - Media Similarity {similarity_percent:.2f}%")
+    plt.legend().legend_handles[0].set_color(scatter_color)
+    plt.tight_layout()
+    plt.savefig(plot_filename_no_ext + '.png', dpi=400)
+    plt.clf()
   # Compute the per-segment slopes once so we can both write them out and
   # summarise their stability.
   segment_rates = []  # (slope_minus_one_pct, dur_seconds)
@@ -1299,9 +1306,15 @@ def align(video_features, audio_desc_features, video_energy, audio_desc_energy):
     compressed_x.extend([np.mean(x[index:index+num])] if compress else x[index:index+num])
     compressed_y.extend([np.mean(y[index:index+num])] if compress else y[index:index+num])
   extend_all(0, num=10)
+  # `last_i` defaults to -60 so the tail extend (last_i + 70 == 10) covers
+  # whatever sits past the initial 10-sample head when the loop range below
+  # is empty (very short inputs). Without this, `i` would be unbound and the
+  # tail line below would NameError instead of returning a clean failure.
+  last_i = -60
   for i in range(10, len(x) - 80, 70):
     extend_all(i, compress=np.all(np.abs(err_y[i:i+70]) < 3))
-  extend_all(i+70)
+    last_i = i
+  extend_all(last_i + 70)
   
   x = compressed_x
   y = compressed_y
