@@ -431,127 +431,160 @@ def parse_audio_from_file(media_file, num_channels=2, cache_dir=None):
   return media_arr
 
 
-def plot_alignment(plot_filename_no_ext, path, audio_times, video_times, similarity_percent,
-                   median_slope, stretch_audio, no_pitch_correction):
-  # Plot rendering is best-effort: if matplotlib isn't installed, skip the
-  # PNG and still write the .txt/.json reports. Lets headless installs
-  # (e.g. inside a server container) get the structured alignment data that
-  # downstream tools depend on without dragging in a GUI toolkit.
-  try:
-    import matplotlib.pyplot as plt
-  except ImportError:
-    plt = None
-  if plt is not None:
-    downsample = 20
-    plot_path = path[::downsample]
-    video_times_full, audio_times_full, cluster_indices, quals, cum_quals = plot_path.T
-    scatter_color = [.2,.4,.8]
-    lcs_rgba = np.zeros((len(quals),4))
-    lcs_rgba[:,:3] = np.array(scatter_color)[None,:]
-    lcs_rgba[:,3] = np.clip(quals * 400. / len(quals), 0, 1)
-    audio_offsets = audio_times_full - video_times_full
-    plt.switch_backend('Agg')
-    plt.scatter(video_times_full / 60., audio_offsets, s=3, c=lcs_rgba, label='Matches')
-    audio_offsets = audio_times - video_times
-    def expand_limits(start, end, ratio=.01):
-      average = (end + start) / 2.
-      half_diff = (end - start) / 2.
-      half_diff *= (1 + ratio)
-      return (average - half_diff, average + half_diff)
-    plt.xlim(expand_limits(*(0, np.max(video_times) / 60.)))
-    plt.ylim(expand_limits(*(np.min(audio_offsets) - 10 * TIMESTEP_SIZE_SECONDS,
-                             np.max(audio_offsets) + 10 * TIMESTEP_SIZE_SECONDS), .05))
-    if stretch_audio:
-      plt.plot(video_times / 60., audio_offsets, 'r-', lw=.5, label='Replaced Audio')
-      audio_times_unreplaced = []
-      video_times_unreplaced = []
-      for i in range(len(video_times) - 1):
-        slope = (audio_times[i+1] - audio_times[i]) / (video_times[i+1] - video_times[i])
-        if abs(1 - slope) > MAX_RATE_RATIO_DIFF_ALIGN:
-          video_times_unreplaced.extend(video_times[i:i+2])
-          audio_times_unreplaced.extend(audio_times[i:i+2])
-          video_times_unreplaced.append(video_times[i+1])
-          audio_times_unreplaced.append(np.nan)
-      if len(video_times_unreplaced) > 0:
-        video_times_unreplaced = np.array(video_times_unreplaced)
-        audio_times_unreplaced = np.array(audio_times_unreplaced)
-        audio_offsets = audio_times_unreplaced - video_times_unreplaced
-        plt.plot(video_times_unreplaced / 60., audio_offsets, 'c-', lw=1, label='Original Audio')
-    else:
-      plt.plot(video_times / 60., audio_offsets, 'r-', lw=1, label='Combined Media')
-    plt.xlabel('Original Video Time (minutes)')
-    plt.ylabel('Original Audio Description Offset (seconds behind video)')
-    plt.title(f"Alignment - Media Similarity {similarity_percent:.2f}%")
-    plt.legend().legend_handles[0].set_color(scatter_color)
-    plt.tight_layout()
-    plt.savefig(plot_filename_no_ext + '.png', dpi=400)
-    plt.clf()
-  # Compute the per-segment slopes once so we can both write them out and
-  # summarise their stability.
-  segment_rates = []  # (slope_minus_one_pct, dur_seconds)
+# Tolerance (percentage points off the median rate) inside which a per-segment
+# rate counts as "on the stable trunk." Tight enough that commercial-break
+# slope artifacts are excluded, loose enough that PAL/NTSC drift (~4.27%) sits
+# entirely inside one trunk.
+_STABLE_RATE_TOLERANCE_PP = 0.3
+
+
+def _compute_report_data(audio_times, video_times, median_slope):
+  """
+  Distil the alignment arrays into the structure both report formats render
+  from. Returned as a dict so the field names stay self-documenting at the
+  call sites and the .txt + .json paths never disagree on a value.
+
+  Keys:
+    segment_records:           per-segment dicts (rate_pct + time ranges)
+    median_rate_pct:           video→audio rate delta as a percentage
+    stable_fraction_pct:       fraction of runtime within tolerance of median
+    video_offset:              video_times[0] - audio_times[0]
+    version_hash:              short content hash of this source file
+  """
+  median_rate_pct = (median_slope - 1.0) * 100.0
+  segment_records = []
+  total_dur = 0.0
+  stable_dur = 0.0
   for i in range(len(video_times) - 1):
     seg_dur = video_times[i + 1] - video_times[i]
     if seg_dur <= 0:
       continue
-    slope = (video_times[i + 1] - video_times[i]) / (audio_times[i + 1] - audio_times[i])
-    segment_rates.append(((slope - 1.) * 100., seg_dur))
-
-  median_rate_pct = (median_slope - 1.) * 100.
-  total_dur = sum(d for _, d in segment_rates)
-  STABLE_RATE_TOLERANCE_PP = 0.3
-  stable_dur = sum(
-    d for r, d in segment_rates if abs(r - median_rate_pct) <= STABLE_RATE_TOLERANCE_PP
-  )
-  stable_fraction_pct = (100. * stable_dur / total_dur) if total_dur > 0 else 0.
-
-  this_script_path = os.path.abspath(__file__)
-  version_hash = get_version_hash(this_script_path)
-  video_offset = video_times[0] - audio_times[0]
-
-  def str_from_time(seconds):
-    minutes, seconds = divmod(seconds, 60)
-    hours, minutes = divmod(minutes, 60)
-    return f"{hours:2.0f}:{minutes:02.0f}:{seconds:06.3f}"
-
-  # Both the .txt and .json reports are rendered from the same in-memory
-  # structure, so consumers picking either format see identical numbers.
-  segment_records = []
-  for i in range(len(video_times) - 1):
-    slope = (video_times[i+1] - video_times[i]) / (audio_times[i+1] - audio_times[i])
+    slope = seg_dur / (audio_times[i + 1] - audio_times[i])
+    rate_pct = (slope - 1.0) * 100.0
     segment_records.append({
-      "rate_pct": (slope - 1.) * 100.,
+      "rate_pct": rate_pct,
       "video_start_sec": float(video_times[i]),
       "video_end_sec": float(video_times[i + 1]),
       "audio_start_sec": float(audio_times[i]),
       "audio_end_sec": float(audio_times[i + 1]),
     })
+    total_dur += seg_dur
+    if abs(rate_pct - median_rate_pct) <= _STABLE_RATE_TOLERANCE_PP:
+      stable_dur += seg_dur
+  stable_fraction_pct = (100.0 * stable_dur / total_dur) if total_dur > 0 else 0.0
+  return {
+    "segment_records": segment_records,
+    "median_rate_pct": median_rate_pct,
+    "stable_fraction_pct": stable_fraction_pct,
+    "video_offset": video_times[0] - audio_times[0],
+    "version_hash": get_version_hash(os.path.abspath(__file__)),
+  }
+
+
+def _format_hms(seconds):
+  """Render seconds as ``H:MM:SS.sss`` for the .txt report's segment lines."""
+  minutes, seconds = divmod(seconds, 60)
+  hours, minutes = divmod(minutes, 60)
+  return f"{hours:2.0f}:{minutes:02.0f}:{seconds:06.3f}"
+
+
+def _try_render_alignment_plot(plot_filename_no_ext, path, audio_times, video_times,
+                               similarity_percent, stretch_audio):
+  """
+  Render the alignment scatter+line plot to ``<plot_filename_no_ext>.png``.
+
+  Best-effort: if matplotlib isn't installed, this is a no-op so headless
+  installs (e.g. the describarr server container) still get the .txt/.json
+  reports written by ``_write_alignment_reports``.
+  """
+  try:
+    import matplotlib.pyplot as plt
+  except ImportError:
+    return
+
+  downsample = 20
+  plot_path = path[::downsample]
+  video_times_full, audio_times_full, _cluster_indices, quals, _cum_quals = plot_path.T
+  scatter_color = [.2, .4, .8]
+  lcs_rgba = np.zeros((len(quals), 4))
+  lcs_rgba[:, :3] = np.array(scatter_color)[None, :]
+  lcs_rgba[:, 3] = np.clip(quals * 400. / len(quals), 0, 1)
+  audio_offsets = audio_times_full - video_times_full
+  plt.switch_backend('Agg')
+  plt.scatter(video_times_full / 60., audio_offsets, s=3, c=lcs_rgba, label='Matches')
+  audio_offsets = audio_times - video_times
+
+  def expand_limits(start, end, ratio=.01):
+    average = (end + start) / 2.
+    half_diff = (end - start) / 2.
+    half_diff *= (1 + ratio)
+    return (average - half_diff, average + half_diff)
+
+  plt.xlim(expand_limits(*(0, np.max(video_times) / 60.)))
+  plt.ylim(expand_limits(*(np.min(audio_offsets) - 10 * TIMESTEP_SIZE_SECONDS,
+                           np.max(audio_offsets) + 10 * TIMESTEP_SIZE_SECONDS), .05))
+  if stretch_audio:
+    plt.plot(video_times / 60., audio_offsets, 'r-', lw=.5, label='Replaced Audio')
+    audio_times_unreplaced = []
+    video_times_unreplaced = []
+    for i in range(len(video_times) - 1):
+      slope = (audio_times[i + 1] - audio_times[i]) / (video_times[i + 1] - video_times[i])
+      if abs(1 - slope) > MAX_RATE_RATIO_DIFF_ALIGN:
+        video_times_unreplaced.extend(video_times[i:i + 2])
+        audio_times_unreplaced.extend(audio_times[i:i + 2])
+        video_times_unreplaced.append(video_times[i + 1])
+        audio_times_unreplaced.append(np.nan)
+    if len(video_times_unreplaced) > 0:
+      video_times_unreplaced = np.array(video_times_unreplaced)
+      audio_times_unreplaced = np.array(audio_times_unreplaced)
+      audio_offsets = audio_times_unreplaced - video_times_unreplaced
+      plt.plot(video_times_unreplaced / 60., audio_offsets, 'c-', lw=1, label='Original Audio')
+  else:
+    plt.plot(video_times / 60., audio_offsets, 'r-', lw=1, label='Combined Media')
+  plt.xlabel('Original Video Time (minutes)')
+  plt.ylabel('Original Audio Description Offset (seconds behind video)')
+  plt.title(f"Alignment - Media Similarity {similarity_percent:.2f}%")
+  plt.legend().legend_handles[0].set_color(scatter_color)
+  plt.tight_layout()
+  plt.savefig(plot_filename_no_ext + '.png', dpi=400)
+  plt.clf()
+
+
+def _write_alignment_reports(plot_filename_no_ext, report_data, similarity_percent,
+                             stretch_audio, no_pitch_correction):
+  """
+  Write the .txt and .json reports describarr (and any other downstream tool)
+  consumes. Both files render from the same in-memory structure so consumers
+  picking either format see identical numbers.
+  """
+  segment_records = report_data["segment_records"]
+  version_hash = report_data["version_hash"]
+  stable_fraction_pct = report_data["stable_fraction_pct"]
+  median_rate_pct = report_data["median_rate_pct"]
+  video_offset = report_data["video_offset"]
+  parameters = {"stretch_audio": stretch_audio, "no_pitch_correction": no_pitch_correction}
 
   with open(plot_filename_no_ext + '.txt', 'w') as file:
-    parameters = {'stretch_audio':stretch_audio, 'no_pitch_correction':no_pitch_correction}
     print(f"Parameters: {parameters}", file=file)
     print(f"Version Hash: {version_hash}", file=file)
     print(f"Input file similarity: {similarity_percent:.2f}%", file=file)
-    # Stable Trunk Fraction: fraction of total runtime in segments whose rate
-    # sits within STABLE_RATE_TOLERANCE_PP of the median. PAL/NTSC sources
-    # (whose pitch shift drags the similarity score down) score ~99% here,
-    # making this the cleaner signal for "alignment is structurally correct".
+    # Stable Trunk Fraction is the cleaner signal for "alignment is
+    # structurally correct" on PAL/NTSC sources, whose pitch shift drags the
+    # similarity score down while still producing ~99% stable trunk.
     print(f"Stable Trunk Fraction: {stable_fraction_pct:.2f}%", file=file)
     print("Main changes needed to video to align it to audio input:", file=file)
     print(f"Start Offset: {-video_offset:.2f} seconds", file=file)
     print(f"Median Rate Change: {median_rate_pct:.2f}%", file=file)
     for seg in segment_records:
-      print(f"Rate change of {seg['rate_pct']:8.1f}% from {str_from_time(seg['video_start_sec'])} to " + \
-            f"{str_from_time(seg['video_end_sec'])} aligning with audio from " + \
-            f"{str_from_time(seg['audio_start_sec'])} to {str_from_time(seg['audio_end_sec'])}", file=file)
+      print(f"Rate change of {seg['rate_pct']:8.1f}% from {_format_hms(seg['video_start_sec'])} to "
+            f"{_format_hms(seg['video_end_sec'])} aligning with audio from "
+            f"{_format_hms(seg['audio_start_sec'])} to {_format_hms(seg['audio_end_sec'])}",
+            file=file)
 
-  # JSON twin of the .txt report. Same numbers, parseable without regex.
   json_report = {
     "version": __version__,
     "version_hash": version_hash,
-    "parameters": {
-      "stretch_audio": stretch_audio,
-      "no_pitch_correction": no_pitch_correction,
-    },
+    "parameters": parameters,
     "similarity_pct": float(similarity_percent),
     "stable_trunk_fraction_pct": float(stable_fraction_pct),
     "median_rate_pct": float(median_rate_pct),
@@ -561,6 +594,20 @@ def plot_alignment(plot_filename_no_ext, path, audio_times, video_times, similar
   import json as _json
   with open(plot_filename_no_ext + '.json', 'w') as file:
     _json.dump(json_report, file, indent=2)
+
+
+def plot_alignment(plot_filename_no_ext, path, audio_times, video_times, similarity_percent,
+                   median_slope, stretch_audio, no_pitch_correction):
+  """
+  Write the alignment PNG (best-effort, requires matplotlib) and the .txt +
+  .json reports (always). The reports are what describarr and other
+  downstream tooling consume; the PNG is for human-eyeball debugging.
+  """
+  report_data = _compute_report_data(audio_times, video_times, median_slope)
+  _try_render_alignment_plot(plot_filename_no_ext, path, audio_times, video_times,
+                             similarity_percent, stretch_audio)
+  _write_alignment_reports(plot_filename_no_ext, report_data, similarity_percent,
+                           stretch_audio, no_pitch_correction)
 
 # use the smooth alignment to replace runs of video sound with corresponding described audio
 def replace_aligned_segments(video_arr, audio_desc_arr, audio_desc_times, video_times, no_pitch_correction):
@@ -1305,16 +1352,21 @@ def align(video_features, audio_desc_features, video_energy, audio_desc_energy):
   def extend_all(index, compress=False, num=70):
     compressed_x.extend([np.mean(x[index:index+num])] if compress else x[index:index+num])
     compressed_y.extend([np.mean(y[index:index+num])] if compress else y[index:index+num])
-  extend_all(0, num=10)
-  # `last_i` defaults to -60 so the tail extend (last_i + 70 == 10) covers
-  # whatever sits past the initial 10-sample head when the loop range below
-  # is empty (very short inputs). Without this, `i` would be unbound and the
-  # tail line below would NameError instead of returning a clean failure.
-  last_i = -60
-  for i in range(10, len(x) - 80, 70):
-    extend_all(i, compress=np.all(np.abs(err_y[i:i+70]) < 3))
+  # Head + body + tail compression of the x/y arrays. The body loop walks in
+  # 70-sample strides starting at 10; the tail extend below picks up whatever
+  # sits past the last full stride. Pre-seeding `last_i` to (loop_start -
+  # stride) keeps the tail correct when the loop range is empty (very short
+  # inputs), where otherwise `i` would be unbound and the tail would crash
+  # with NameError instead of returning a clean AlignmentMismatchError.
+  HEAD_LEN = 10
+  STRIDE = 70
+  TAIL_GAP = 80  # loop stops STRIDE+TAIL_GAP samples before len(x)
+  extend_all(0, num=HEAD_LEN)
+  last_i = HEAD_LEN - STRIDE
+  for i in range(HEAD_LEN, len(x) - TAIL_GAP, STRIDE):
+    extend_all(i, compress=np.all(np.abs(err_y[i:i + STRIDE]) < 3))
     last_i = i
-  extend_all(last_i + 70)
+  extend_all(last_i + STRIDE)
   
   x = compressed_x
   y = compressed_y
