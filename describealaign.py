@@ -127,9 +127,12 @@ def diagnose_alignment_failure(video_energy, audio_desc_energy):
   pattern, ``summary`` is a generic "could not classify" line and the
   caller can fall back to the raw numbers.
   """
-  # Energies are at 105-decimation, so length ≈ duration_seconds * 420.
-  v_dur = len(video_energy) / 420.0
-  a_dur = len(audio_desc_energy) / 420.0
+  # Energies are produced by `get_energy()`: 105-decimation followed by
+  # `[::decimation2]` with decimation2=2, so length ≈ duration_seconds * 210
+  # (AUDIO_SAMPLE_RATE / 105 / 2 = 44100 / 105 / 2 = 210). Using 420 here
+  # silently halved every duration reported in the diagnostic line.
+  v_dur = len(video_energy) / 210.0
+  a_dur = len(audio_desc_energy) / 210.0
   ratio = a_dur / v_dur if v_dur > 0 else 0.0
 
   # "quiet" mask matches the not_quiet threshold the algorithm itself uses.
@@ -654,7 +657,12 @@ def replace_aligned_segments(video_arr, audio_desc_arr, audio_desc_times, video_
                                           audio_desc_arr[:,slice(*interp_bounds)],
                                           copy=False, bounds_error=False, fill_value=0,
                                           kind='quadratic', assume_sorted=True)
-      interpolated_chunks.append(interp(chunk).astype(np.float16))
+      # Keep float32: post-gain AD samples routinely exceed float16's 65504
+      # ceiling (any gain >= 2× on a peaked source overflows to +/-inf,
+      # which the downstream peak limiter then turns into a divide-by-inf
+      # that zeros the entire output). The memory savings of float16 are
+      # negligible vs. video_arr itself; correctness wins.
+      interpolated_chunks.append(interp(chunk).astype(np.float32))
     return np.hstack(interpolated_chunks)
   
   # yields matrices of pearson correlations indexed by the first window's start and
