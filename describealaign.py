@@ -334,7 +334,17 @@ def run_async_ffmpeg_command(command, media_arr, err_msg):
     media_arr_T = media_arr.T  # view (samples, channels); no copy
     try:
       for start in range(0, media_arr_T.shape[0], chunk_samples):
-        chunk = media_arr_T[start:start + chunk_samples].astype(np.int16)
+        raw = media_arr_T[start:start + chunk_samples]
+        # Sanitise before the int16 cast: a NaN sample silently casts to
+        # an undefined int16 (often the minimum, -32768) → loud digital
+        # pop; a sample outside int16 range wraps. Non-finite values can
+        # leak in from interpolation residue, optimisation noise, or any
+        # divide-by-zero we missed. nan_to_num + clip is cheap and
+        # eliminates the whole class of "one bad sample blows up the
+        # output" failure modes the peak limiter (which itself can be
+        # bypassed by a NaN peak) doesn't catch.
+        safe = np.nan_to_num(raw, nan=0.0, posinf=32767.0, neginf=-32768.0)
+        chunk = np.clip(safe, -32768.0, 32767.0).astype(np.int16)
         ffmpeg_caller.stdin.write(chunk.tobytes())
     except BrokenPipeError:
       # ffmpeg died early; wait() below surfaces the real return code.
@@ -1941,6 +1951,19 @@ def combine(video, audio, stretch_audio=False, yes=False, prepend="ad_", no_pitc
 
       replace_aligned_segments(video_arr, audio_desc_arr, audio_desc_times, video_times, no_pitch_correction)
       del audio_desc_arr
+
+      # Sanitise non-finite samples BEFORE computing the peak: a single
+      # NaN/inf would make `peak` non-finite, `peak > limit` would evaluate
+      # to False or True with garbage `limit/peak`, and the int16 cast at
+      # output write time would emit undefined samples (loud digital pops).
+      # Zero the offending samples — they're either rare interpolation
+      # residue (silent, OK) or evidence of a pathological alignment we
+      # shouldn't be muxing anyway (preferable to a loud glitch).
+      finite_mask = np.isfinite(video_arr)
+      if not finite_mask.all():
+        bad = video_arr.size - int(finite_mask.sum())
+        print(f"  WARNING: zeroing {bad} non-finite sample(s) before peak limit")
+        video_arr[~finite_mask] = 0.0
 
       # Prevent peaking by attenuating to within ±32,766 if and only if the
       # signal already exceeds that range. Unconditionally scaling to peak
