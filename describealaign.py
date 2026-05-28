@@ -1107,13 +1107,22 @@ def write_passthrough_media_to_disk(output_filename, video_file, audio_desc_file
     label = title or ('original' if n_audio == 1 else f'audio {i + 1}')
     out_kwargs[f'disposition:a:{i + 1}'] = '0'
     out_kwargs[f'metadata:s:a:{i + 1}'] = f'title={label}'
-  streams = [ad_input, original['v']]
+  # Map only the AD file's first audio stream — an MP3/M4A AD source can
+  # legitimately ship with embedded cover art (a JPEG video stream), and
+  # the bare `ad_input` would map that as an extra output video stream
+  # ahead of the real one. Hardware decoders / library scanners then
+  # treat the cover art as the primary video.
+  streams = [ad_input['a:0'], original['v']]
   if n_audio > 0:
     streams.append(original['a'])
   if n_subtitle > 0:
     streams.append(original['s'])
   if n_attachment > 0:
     streams.append(original['t'])
+    # MKV expects attachments to be stream-copied explicitly; without
+    # `c:t copy` ffmpeg sometimes tries to pick an encoder for font
+    # attachments and the whole mux fails.
+    out_kwargs['c:t'] = 'copy'
   write_command = ffmpeg.output(*streams, output_filename, **out_kwargs).overwrite_output()
   run_ffmpeg_command(write_command, f"write output file: {output_filename}")
 
@@ -1158,6 +1167,9 @@ def write_replaced_media_to_disk(output_filename, media_arr, video_file=None, au
         label = title or ('original' if n_audio == 1 else f'audio {i + 1}')
         out_kwargs[f'disposition:a:{i + 1}'] = '0'
         out_kwargs[f'metadata:s:a:{i + 1}'] = f'title={label}'
+      # media_input here is the raw-PCM pipe — exactly one stream, no
+      # cover art risk. The AD-side cover-art guard lives in the other
+      # branches (passthrough + stretch_video).
       streams = [media_input, original_video['v']]
       if n_audio > 0:
         streams.append(original_video['a'])
@@ -1165,6 +1177,7 @@ def write_replaced_media_to_disk(output_filename, media_arr, video_file=None, au
         streams.append(original_video['s'])
       if n_attachment > 0:
         streams.append(original_video['t'])
+        out_kwargs['c:t'] = 'copy'
       write_command = ffmpeg.output(*streams, output_filename, **out_kwargs).overwrite_output()
     run_async_ffmpeg_command(write_command, media_arr, f"write output file: {output_filename}")
   else:
@@ -1204,13 +1217,19 @@ def write_replaced_media_to_disk(output_filename, media_arr, video_file=None, au
       out_kwargs[f'bsf:a:{i + 1}'] = f"setts=ts='{setts_cmd}'"
       out_kwargs[f'disposition:a:{i + 1}'] = '0'
       out_kwargs[f'metadata:s:a:{i + 1}'] = f'title={label}'
-    streams = [media_input, original_video['v']]
+    # In this branch media_input IS the AD file (the `else` branch above,
+    # where media_arr is None). Same cover-art hazard as the passthrough
+    # mux: bare `media_input` maps every stream in the AD file. Restrict
+    # to the first audio stream so an MP3-with-cover-art doesn't smuggle
+    # a video stream ahead of the real one.
+    streams = [media_input['a:0'], original_video['v']]
     if n_audio > 0:
       streams.append(original_video['a'])
     if n_subtitle > 0:
       streams.append(original_video['s'])
     if n_attachment > 0:
       streams.append(original_video['t'])
+      out_kwargs['c:t'] = 'copy'
     write_command = ffmpeg.output(*streams, output_filename, **out_kwargs).overwrite_output()
     run_ffmpeg_command(write_command, f"write output file: {output_filename}")
 
