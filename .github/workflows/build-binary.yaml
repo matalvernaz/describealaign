@@ -103,6 +103,7 @@ jobs:
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
         with:
+          retention-days: 5
           name: ${{ runner.os }}-build
           path: |
             dist/*.pkg
