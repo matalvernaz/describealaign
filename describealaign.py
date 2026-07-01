@@ -354,8 +354,12 @@ def run_async_ffmpeg_command(command, media_arr, err_msg):
         ffmpeg_caller.stdin.close()
       except OSError:
         pass
-    returncode = ffmpeg_caller.wait()
-    stderr_thread.join(timeout=5.0)
+      # Reap the child and join the stderr drain from the finally, not after
+      # it: a non-BrokenPipe write failure (OSError, a numpy error in the
+      # sanitise step, …) would otherwise propagate straight past wait() and
+      # leave ffmpeg as an un-reaped zombie with the stderr thread still alive.
+      returncode = ffmpeg_caller.wait()
+      stderr_thread.join(timeout=5.0)
     err = b''.join(stderr_chunks)
     if returncode != 0:
       print("  ERROR: ffmpeg failed to " + err_msg)
@@ -501,9 +505,13 @@ def _compute_report_data(audio_times, video_times, median_slope):
   stable_dur = 0.0
   for i in range(len(video_times) - 1):
     seg_dur = video_times[i + 1] - video_times[i]
-    if seg_dur <= 0:
+    audio_dur = audio_times[i + 1] - audio_times[i]
+    # Skip degenerate segments in either axis. A zero/negative audio delta
+    # comes from a non-monotonic alignment pair; dividing by it raised
+    # ZeroDivisionError and crashed the entire report + diagnostic write.
+    if seg_dur <= 0 or audio_dur <= 0:
       continue
-    slope = seg_dur / (audio_times[i + 1] - audio_times[i])
+    slope = seg_dur / audio_dur
     rate_pct = (slope - 1.0) * 100.0
     segment_records.append({
       "rate_pct": rate_pct,
@@ -638,6 +646,34 @@ def _write_alignment_reports(plot_filename_no_ext, report_data, similarity_perce
   import json as _json
   with open(plot_filename_no_ext + '.json', 'w') as file:
     _json.dump(json_report, file, indent=2)
+
+
+def _write_failure_sidecar(alignment_dir, video_file, diagnostic):
+  """Write ``<alignment_dir>/<video-basename>.fail.json`` describing why an
+  alignment failed, mirroring the success ``.json`` report's location.
+
+  Consumed by describarr (and any downstream automation) to surface an
+  actionable cause to the user. The schema is intentionally small and stable:
+  ``error`` (machine code), ``summary`` (human string), and the raw
+  ``diagnostic`` numbers. Best-effort — a problem writing the sidecar must
+  never mask the original AlignmentMismatchError.
+  """
+  try:
+    ensure_folders_exist([alignment_dir])
+    base = os.path.splitext(os.path.split(video_file)[1])[0]
+    sidecar_path = os.path.join(alignment_dir, base + '.fail.json')
+    summary = diagnostic.get('summary', '') if isinstance(diagnostic, dict) else ''
+    payload = {
+      "version": __version__,
+      "error": "alignment_mismatch",
+      "summary": summary,
+      "diagnostic": diagnostic if isinstance(diagnostic, dict) else {},
+    }
+    import json as _json
+    with open(sidecar_path, 'w') as file:
+      _json.dump(payload, file, indent=2)
+  except Exception:
+    pass
 
 
 def plot_alignment(plot_filename_no_ext, path, audio_times, video_times, similarity_percent,
@@ -1461,6 +1497,12 @@ def align(video_features, audio_desc_features, video_energy, audio_desc_energy):
   video_features_scaled = []
   for video_feature, audio_desc_feature in zip(video_features, audio_desc_features):
     audio_desc_feature_std = np.std(audio_desc_feature)
+    # A zero-variance feature (constant/silent audio band) makes the two
+    # divisions below produce inf/NaN and poisons the L1 slope fit with
+    # garbage coordinates. Such a feature carries no alignment signal, so fall
+    # back to a unit scale and let it contribute nothing rather than explode.
+    if not np.isfinite(audio_desc_feature_std) or audio_desc_feature_std < 1e-9:
+      audio_desc_feature_std = 1.0
     scale_factor = np.linalg.lstsq(video_feature[y][:,None], audio_desc_feature[x], rcond=None)[0]
     audio_desc_features_scaled.append(audio_desc_feature / audio_desc_feature_std)
     video_features_scaled.append(video_feature * scale_factor / audio_desc_feature_std)
@@ -1870,7 +1912,16 @@ def combine(video, audio, stretch_audio=False, yes=False, prepend="ad_", no_pitc
       del audio_desc_arr
 
     _t = time.monotonic()
-    outputs = align(video_features, audio_desc_features, video_energy, audio_desc_energy)
+    try:
+      outputs = align(video_features, audio_desc_features, video_energy, audio_desc_energy)
+    except AlignmentMismatchError as err:
+      # Persist the structured failure diagnosis next to where the success
+      # report would have gone (<basename>.fail.json) so an automated consumer
+      # like describarr can tell the user *why* it failed (wrong episode,
+      # silent AD, …) instead of a bare "alignment failed".
+      if PLOT_ALIGNMENT_TO_FILE:
+        _write_failure_sidecar(alignment_dir, video_file, err.diagnostic)
+      raise
     audio_desc_times, video_times, similarity_percent, path, median_slope = outputs
     print(f"  aligned ({time.monotonic() - _t:.1f}s)          ")
     
