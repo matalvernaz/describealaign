@@ -233,6 +233,9 @@ import natsort
 from collections import defaultdict
 from sortedcontainers import SortedList
 import hashlib
+import subprocess
+import threading
+import uuid
 
 try:
   import wx
@@ -436,10 +439,143 @@ def _evict_until_fits(cache_dir, incoming_size_bytes):
       pass
 
 
-# read audio from file with ffmpeg and convert to numpy array
+# Streamed-decode chunk sizes. The read chunk is deliberately modest: peak
+# resident memory during a decode is ~3x this (raw bytes + the int16 view's
+# float32 conversion during the transpose pass), regardless of file length.
+_DECODE_READ_BYTES = 8 * 1024 * 1024
+_DECODE_COPY_FRAMES = 4 * 1024 * 1024
+
+
+def _stream_decode_to_npy(media_file, num_channels, npy_path):
+  """Decode the first audio track of *media_file* to a ``(channels, samples)``
+  C-order float32 ``.npy`` at *npy_path*, never holding the track in memory.
+
+  ffmpeg's s16le output is streamed to an interleaved int16 scratch file in
+  frame-aligned chunks (a carry buffer preserves any partial frame across
+  short reads), then transposed+converted into the .npy in bounded pieces.
+  The .npy layout matches what ``np.save`` historically wrote for these
+  arrays, so pre-existing cache entries stay readable.
+
+  Returns the per-channel sample count. Raises RuntimeError on ffmpeg
+  failure, a trailing partial frame, or an empty decode.
+  """
+  bytes_per_frame = 2 * num_channels
+  ffmpeg_command = ffmpeg.input(media_file).output('-', format='s16le', acodec='pcm_s16le',
+                                                   af='aresample=async=1:first_pts=0', map='0:a:0',
+                                                   ac=num_channels, ar=AUDIO_SAMPLE_RATE, loglevel='error')
+  args = ffmpeg_command.compile(cmd=get_ffmpeg())
+  proc = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+  # stderr is drained concurrently so a chatty ffmpeg can never fill the pipe
+  # and deadlock against our stdout reads.
+  stderr_chunks = []
+  def _drain_stderr():
+    while True:
+      block = proc.stderr.read(65536)
+      if not block:
+        return
+      stderr_chunks.append(block)
+  drainer = threading.Thread(target=_drain_stderr, daemon=True)
+  drainer.start()
+
+  raw_path = npy_path + '.raw'
+  tmp_npy = npy_path + '.part'
+  n_frames = 0
+  carry = b''
+  try:
+    with open(raw_path, 'wb') as raw:
+      while True:
+        block = proc.stdout.read(_DECODE_READ_BYTES)
+        if not block:
+          break
+        if carry:
+          block = carry + block
+          carry = b''
+        usable = len(block) - (len(block) % bytes_per_frame)
+        if usable != len(block):
+          carry = block[usable:]
+          block = block[:usable]
+        if block:
+          raw.write(block)
+          n_frames += len(block) // bytes_per_frame
+    proc.stdout.close()
+    returncode = proc.wait()
+    drainer.join(timeout=30)
+    if returncode != 0:
+      stderr_text = b''.join(stderr_chunks).decode('utf-8', errors='replace')
+      print("  ERROR: ffmpeg failed to parse audio from input file: " + media_file)
+      print("FFmpeg error:")
+      print(stderr_text)
+      raise RuntimeError(f"ffmpeg exited {returncode} decoding {media_file}")
+    if carry:
+      raise RuntimeError(
+          f"ffmpeg emitted a trailing partial PCM frame ({len(carry)} bytes) for {media_file}")
+    if n_frames == 0:
+      raise RuntimeError(f"ffmpeg produced no audio samples for {media_file}")
+
+    # Transpose interleaved (frames, channels) int16 into the (channels,
+    # frames) float32 .npy, in bounded slices.
+    raw_map = np.memmap(raw_path, dtype=np.int16, mode='r', shape=(n_frames, num_channels))
+    out_map = np.lib.format.open_memmap(tmp_npy, mode='w+', dtype=np.float32,
+                                        shape=(num_channels, n_frames))
+    for start in range(0, n_frames, _DECODE_COPY_FRAMES):
+      stop = min(start + _DECODE_COPY_FRAMES, n_frames)
+      out_map[:, start:stop] = raw_map[start:stop, :].T.astype(np.float32)
+    out_map.flush()
+    del out_map, raw_map
+    os.replace(tmp_npy, npy_path)
+  finally:
+    if proc.poll() is None:
+      proc.kill()
+      proc.wait()
+    for leftover in (raw_path, tmp_npy):
+      try:
+        os.remove(leftover)
+      except OSError:
+        pass
+  return n_frames
+
+
+# Frames per slice for scratch copies and other bounded in-place passes over
+# (channels, samples) arrays: 8M frames = 64 MB of dirty float32 stereo per
+# slice, flushed as we go so dirty pages never pile up against a container
+# memory cap.
+_BOUNDED_PASS_FRAMES = 8 * 1024 * 1024
+
+# WSOLA backpointer tables smaller than this stay anonymous (TV-episode
+# segments — fast, no file churn); anything bigger is disk-backed.
+_DP_TABLE_ANON_LIMIT_BYTES = 64 * 1024 * 1024
+
+
+def _writable_scratch_copy(src_arr, scratch_dir, tag):
+  """Copy *src_arr* ((channels, samples)) into a writable disk-backed memmap
+  under *scratch_dir*, in bounded slices.
+
+  The stretch path mutates audio in place (gain match, segment replacement,
+  peak limit). Mutating a cache-backed mapping would permanently corrupt the
+  decode cache, so mutations happen on these scratch copies instead. Returns
+  ``(memmap, path)``; the caller owns the file's lifetime.
+  """
+  path = os.path.join(scratch_dir, f'.tmp.describealaign_{tag}_{uuid.uuid4().hex}.npy')
+  out = np.lib.format.open_memmap(path, mode='w+', dtype=np.float32, shape=src_arr.shape)
+  total = src_arr.shape[1]
+  for start in range(0, total, _BOUNDED_PASS_FRAMES):
+    stop = min(start + _BOUNDED_PASS_FRAMES, total)
+    out[:, start:stop] = src_arr[:, start:stop]
+    out.flush()
+  return out, path
+
+
+# read audio from file with ffmpeg into a read-only disk-backed memmap
 def parse_audio_from_file(media_file, num_channels=2, cache_dir=None):
   # retrieve only the first audio track, injecting silence/trimming to force timestamps to match up
   # for example, when the video starts before the audio this fills that starting gap with silence
+
+  # The returned array is a READ-ONLY np.memmap: its pages live in the file
+  # cache (reclaimable under memory pressure) instead of anonymous RSS, which
+  # is what lets a 3-hour movie's audio "fit" a hard container memory cap.
+  # Callers that need to mutate samples must copy to their own writable
+  # memmap first (see the stretch branch in combine()).
 
   # Cache hit avoids the ~60s ffmpeg-decode step on a 45-minute episode —
   # critical for any retry or tweak-and-rerun workflow.
@@ -449,7 +585,7 @@ def parse_audio_from_file(media_file, num_channels=2, cache_dir=None):
   cache_path = os.path.join(cache_dir, f"{cache_key}.npy") if cache_key else None
   if cache_path and os.path.exists(cache_path):
     try:
-      cached_arr = np.load(cache_path)
+      cached_arr = np.load(cache_path, mmap_mode='r')
       # Touch mtime so the LRU eviction sees this as recently used.
       os.utime(cache_path, None)
       print(f"  audio cache hit ({os.path.basename(media_file)})")
@@ -457,26 +593,25 @@ def parse_audio_from_file(media_file, num_channels=2, cache_dir=None):
     except (ValueError, OSError) as exc:
       print(f"  audio cache read failed, re-decoding: {exc}")
 
-  ffmpeg_command = ffmpeg.input(media_file).output('-', format='s16le', acodec='pcm_s16le',
-                                                   af='aresample=async=1:first_pts=0', map='0:a:0',
-                                                   ac=num_channels, ar=AUDIO_SAMPLE_RATE, loglevel='error')
-  media_stream, _ = run_ffmpeg_command(ffmpeg_command, f"parse audio from input file: {media_file}")
-  media_arr = np.frombuffer(media_stream, np.int16).astype(np.float32).reshape((-1, num_channels)).T
+  os.makedirs(cache_dir, exist_ok=True)
+  if cache_path is None:
+    # Unstatable input can't be cache-keyed; decode to a uniquely-named work
+    # file in the same directory. It's .npy-suffixed, so the LRU eviction
+    # reclaims it like any other entry.
+    cache_path = os.path.join(cache_dir, f"work_{uuid.uuid4().hex}.npy")
 
-  if cache_path:
+  decode_target = cache_path + '.decode'
+  try:
+    _stream_decode_to_npy(media_file, num_channels, decode_target)
+    _evict_until_fits(cache_dir, os.path.getsize(decode_target))
+    os.replace(decode_target, cache_path)
+  finally:
     try:
-      os.makedirs(cache_dir, exist_ok=True)
-      _evict_until_fits(cache_dir, media_arr.nbytes)
-      # np.save auto-appends '.npy' if not already present, so the tmp name
-      # must already end in '.npy' to avoid landing at '<hash>.part.npy'.
-      tmp = cache_path + '.tmp.npy'
-      np.save(tmp, media_arr)
-      os.replace(tmp, cache_path)
-    except OSError as exc:
-      # Caching is best-effort; the run still succeeds even if writing fails.
-      print(f"  audio cache write skipped: {exc}")
+      os.remove(decode_target)
+    except OSError:
+      pass
 
-  return media_arr
+  return np.load(cache_path, mmap_mode='r')
 
 
 # Tolerance (percentage points off the median rate) inside which a per-segment
@@ -690,13 +825,23 @@ def plot_alignment(plot_filename_no_ext, path, audio_times, video_times, similar
                            stretch_audio, no_pitch_correction)
 
 # use the smooth alignment to replace runs of video sound with corresponding described audio
-def replace_aligned_segments(video_arr, audio_desc_arr, audio_desc_times, video_times, no_pitch_correction):
+def replace_aligned_segments(video_arr, audio_desc_arr, audio_desc_times, video_times, no_pitch_correction,
+                             scratch_dir=None):
   # perform quadratic interpolation of the audio description's waveform
   # this allows it to be stretched to match the corresponding video segment
-  def audio_desc_arr_interp(samples):
+  #
+  # Sample points are generated per chunk (same values np.linspace would
+  # produce: start + i*step, endpoint excluded) and results are written
+  # straight into `out`. The old shape — one full-segment float64 linspace,
+  # a list of every interpolated chunk, then np.hstack — held three
+  # movie-sized arrays at once for a single-segment film (PAL drift stretches
+  # the whole movie in one piece).
+  def audio_desc_arr_interp(start, stop, num, out):
     chunk_size = 10**5
-    interpolated_chunks = []
-    for chunk in (samples[i:i+chunk_size] for i in range(0, len(samples), chunk_size)):
+    step = (stop - start) / num
+    for begin in range(0, num, chunk_size):
+      end = min(begin + chunk_size, num)
+      chunk = np.arange(begin, end, dtype=np.float64) * step + start
       interp_bounds = (max(int(chunk[0]-2), 0),
                        min(int(chunk[-1]+2), audio_desc_arr.shape[1]))
       interp = scipy.interpolate.interp1d(np.arange(*interp_bounds),
@@ -708,8 +853,7 @@ def replace_aligned_segments(video_arr, audio_desc_arr, audio_desc_times, video_
       # which the downstream peak limiter then turns into a divide-by-inf
       # that zeros the entire output). The memory savings of float16 are
       # negligible vs. video_arr itself; correctness wins.
-      interpolated_chunks.append(interp(chunk).astype(np.float32))
-    return np.hstack(interpolated_chunks)
+      out[:, begin:end] = interp(chunk).astype(np.float32)
   
   # yields matrices of pearson correlations indexed by the first window's start and
   # the second window's offset from the first window
@@ -783,7 +927,28 @@ def replace_aligned_segments(video_arr, audio_desc_arr, audio_desc_times, video_
     # after the optimal route is determined, the sign of the jumps will be reintroduced
     window_to_offset_diff = lambda window_index: abs(window_to_offset(window_index) - \
                                                      window_to_offset(window_index - 1))
-    backpointers = np.zeros((num_windows, drift_window_size), dtype=np.int16)
+    # A PAL-drift film stretches as ONE segment, so this DP table is
+    # (runtime/window_size, 1025) int16 — ~1.3 GB for a 2h movie. The DP
+    # writes rows forward and the backtrack reads them once in reverse, both
+    # kind to paging, so back the table with a scratch file when it's big.
+    # open_memmap's fresh file reads as zeros, matching np.zeros. TV-sized
+    # segments stay anonymous and fast.
+    bp_bytes = num_windows * drift_window_size * 2
+    if scratch_dir is not None and bp_bytes > _DP_TABLE_ANON_LIMIT_BYTES \
+       and not IS_RUNNING_WINDOWS:
+      bp_path = os.path.join(scratch_dir, f'.tmp.describealaign_dp_{uuid.uuid4().hex}.npy')
+      backpointers = np.lib.format.open_memmap(bp_path, mode='w+', dtype=np.int16,
+                                               shape=(num_windows, drift_window_size))
+      # POSIX unlink-while-mapped: the mapping stays valid, the namespace
+      # entry is gone, and the space is reclaimed at unmap — no cleanup
+      # path to maintain. (Windows can't delete a mapped file, hence the
+      # platform guard above.)
+      try:
+        os.remove(bp_path)
+      except OSError:
+        pass
+    else:
+      backpointers = np.zeros((num_windows, drift_window_size), dtype=np.int16)
     best_jump_locations = np.zeros((num_windows, len(jumps)), dtype=np.int16)
     cum_loss = np.zeros((3, drift_window_size)) + np.inf
     cum_loss[1:, max_drift] = 0
@@ -997,8 +1162,8 @@ def replace_aligned_segments(video_arr, audio_desc_arr, audio_desc_times, video_
     if no_pitch_correction or np.abs(1 - slopes[i]) <= JUST_NOTICEABLE_DIFF_IN_FREQ_RATIO or \
        abs(total_offset_samples[i]) < MIN_STRETCH_OFFSET:
       # construct a stretched audio description waveform using the quadratic interpolator
-      sample_points = np.linspace(*x_samples[i:i+2], num=diff_y_samples[i], endpoint=False)
-      video_arr_slice[:] = audio_desc_arr_interp(sample_points)
+      audio_desc_arr_interp(float(x_samples[i]), float(x_samples[i+1]),
+                            int(diff_y_samples[i]), video_arr_slice)
     else:
       stretch(audio_desc_arr[:,slice(*x_samples[i:i+2])], video_arr_slice)
 
@@ -1314,11 +1479,32 @@ def get_energy(arr):
   energy_smooth = np.log10(1 + energy_smooth) / 2.
   return energy_smooth[::decimation2]
 
+# Chunk length for get_zero_crossings, a multiple of its 210-sample window so
+# per-window counts never span a chunk seam. ~10.5M frames = ~21 MB of bool
+# temporaries per chunk for stereo (the unchunked version allocated two
+# full-length bool arrays — movie-sized).
+_XINGS_CHUNK_FRAMES = 210 * 50_000
+
+
 def get_zero_crossings(arr):
-  xings = np.diff(np.signbit(arr), prepend=False, axis=-1)
-  xings_clip = xings[:,:(xings.shape[1] - (xings.shape[1] % 210))].reshape(xings.shape[0], -1, 210)
-  zero_crossings = np.sum(np.abs(xings_clip), axis=(0,2)).astype(np.float32)
-  if xings.shape[0] == 1:
+  num_channels = arr.shape[0]
+  usable = arr.shape[1] - (arr.shape[1] % 210)
+  window_counts = []
+  prev_signbit = None
+  for start in range(0, usable, _XINGS_CHUNK_FRAMES):
+    stop = min(start + _XINGS_CHUNK_FRAMES, usable)
+    signbits = np.signbit(arr[:, start:stop])
+    # A crossing at a chunk seam compares against the previous chunk's last
+    # sample, exactly as the unchunked diff did; the first sample of the
+    # whole track compares against an implicit False, also as before.
+    prepend = False if prev_signbit is None else prev_signbit[:, None]
+    xings = np.diff(signbits, prepend=prepend, axis=-1)
+    prev_signbit = signbits[:, -1]
+    xings_clip = xings.reshape(num_channels, -1, 210)
+    window_counts.append(np.sum(np.abs(xings_clip), axis=(0, 2)).astype(np.float32))
+  zero_crossings = np.concatenate(window_counts) if window_counts \
+      else np.zeros(0, dtype=np.float32)
+  if num_channels == 1:
     zero_crossings *= 2
   hann_window = scipy.signal.windows.hann(15)[1:-1].astype(np.float32)
   hann_window = hann_window / np.sum(hann_window)
@@ -1879,6 +2065,11 @@ def combine(video, audio, stretch_audio=False, yes=False, prepend="ad_", no_pitc
       print("  WARNING: very long output path, ffmpeg may fail...")
 
     num_channels = 2 if stretch_audio else 1
+    # Sequential feature extraction: decode one file, distil its (small)
+    # features, release the mapping before touching the next file. Alignment
+    # itself only needs the features, so no full-length audio stays resident
+    # across align(). The stretch branch re-opens the audio afterwards — an
+    # instant cache hit — and only when the alignment actually needs it.
     _t = time.monotonic()
     print("  reading video file...\r", end='')
     video_arr = parse_audio_from_file(video_file, num_channels)
@@ -1892,8 +2083,7 @@ def combine(video, audio, stretch_audio=False, yes=False, prepend="ad_", no_pitc
     video_features = [video_energy, video_zero_crossings] + video_freq_bands
     print(f"  computed video features ({time.monotonic() - _t:.1f}s)          ")
 
-    if not stretch_audio:
-      del video_arr
+    del video_arr
 
     _t = time.monotonic()
     print("  reading audio file...       \r", end='')
@@ -1908,8 +2098,7 @@ def combine(video, audio, stretch_audio=False, yes=False, prepend="ad_", no_pitc
     audio_desc_features = [audio_desc_energy, audio_desc_zero_crossings] + audio_desc_freq_bands
     print(f"  computed audio features ({time.monotonic() - _t:.1f}s)          ")
 
-    if not stretch_audio:
-      del audio_desc_arr
+    del audio_desc_arr
 
     _t = time.monotonic()
     try:
@@ -1968,8 +2157,6 @@ def combine(video, audio, stretch_audio=False, yes=False, prepend="ad_", no_pitc
 
     if can_passthrough:
       print(f"  passthrough mux (slope ~1.0, offset {passthrough_offset:+.3f}s)")
-      del audio_desc_arr
-      del video_arr
       if dry_run:
         print(f"  [dry run] would write: {output_filename}")
       else:
@@ -1981,85 +2168,127 @@ def combine(video, audio, stretch_audio=False, yes=False, prepend="ad_", no_pitc
           _cleanup_tmp()
           raise
     elif stretch_audio:
-      # Per-channel std using the variance-decomposition identity, without
-      # allocating an (channels, samples) diff array. Float64 accumulation
-      # prevents precision drift on long clips, and `maximum(..., 0.0)`
-      # guards against negative-inside-sqrt for DC-offset / constant signals
-      # which would otherwise produce NaN and silently poison every sample
-      # of the muxed output.
-      def low_ram_std(arr):
-        n = arr.shape[1]
-        sums = np.sum(arr, axis=1, dtype=np.float64)
-        sumsq = np.einsum('ij,ij->i', arr, arr, dtype=np.float64)
-        mean = sums / n
-        var = np.maximum(sumsq / n - mean * mean, 0.0)
-        return np.sqrt(var)
+      # The passes below (gain match, segment replacement, peak limit) mutate
+      # audio in place. Mutating the read-only decode-cache mappings would
+      # permanently corrupt cached audio, so the stretch path works on
+      # disk-backed scratch copies beside the output temp file. Re-parsing
+      # here is an instant cache hit; scratch files are removed on every
+      # exit path.
+      scratch_paths = []
+      try:
+        video_arr, scratch_path = _writable_scratch_copy(
+            parse_audio_from_file(video_file, num_channels), out_dir_for_tmp, 'video')
+        scratch_paths.append(scratch_path)
+        audio_desc_arr, scratch_path = _writable_scratch_copy(
+            parse_audio_from_file(audio_desc_file, num_channels), out_dir_for_tmp, 'ad')
+        scratch_paths.append(scratch_path)
 
-      # Rescale RMS intensity of AD to match video, applying ONE scalar gain
-      # to all channels rather than per-channel ratios. Per-channel scaling
-      # destroys the AD's stereo image whenever the video's L/R energy
-      # balance differs from the AD's: e.g. a 5.1 video downmixed to stereo
-      # often has surround content shifted toward one side, which would pan
-      # the narrator's voice toward the other side after a per-channel
-      # rescale.
-      video_stds = low_ram_std(video_arr)
-      ad_stds = low_ram_std(audio_desc_arr)
-      ad_level = float(np.mean(ad_stds))
-      if ad_level < 1.0:
-        # AD audio is effectively silent (RMS < 1 int16 unit). Skipping gain
-        # match prevents inf/NaN from corrupting the mux; the alignment that
-        # produced these times will fail downstream anyway, but at least the
-        # original video audio is left intact.
-        print(f"  WARNING: AD audio near-silent (RMS {ad_level:.2f}), skipping gain match")
-      else:
-        gain = float(np.mean(video_stds)) / ad_level
-        # Clamp pathological gains. Real-world AD vs broadcast video sits
-        # within roughly 0.1x-10x; anything beyond that is a sign the AD or
-        # the source is degenerate and we shouldn't blow out the output.
-        gain = max(0.01, min(100.0, gain))
-        audio_desc_arr *= gain
+        # Per-channel std using the variance-decomposition identity, without
+        # allocating an (channels, samples) diff array. Float64 accumulation
+        # prevents precision drift on long clips, and `maximum(..., 0.0)`
+        # guards against negative-inside-sqrt for DC-offset / constant signals
+        # which would otherwise produce NaN and silently poison every sample
+        # of the muxed output.
+        def low_ram_std(arr):
+          n = arr.shape[1]
+          sums = np.sum(arr, axis=1, dtype=np.float64)
+          sumsq = np.einsum('ij,ij->i', arr, arr, dtype=np.float64)
+          mean = sums / n
+          var = np.maximum(sumsq / n - mean * mean, 0.0)
+          return np.sqrt(var)
 
-      replace_aligned_segments(video_arr, audio_desc_arr, audio_desc_times, video_times, no_pitch_correction)
-      del audio_desc_arr
+        # Rescale RMS intensity of AD to match video, applying ONE scalar gain
+        # to all channels rather than per-channel ratios. Per-channel scaling
+        # destroys the AD's stereo image whenever the video's L/R energy
+        # balance differs from the AD's: e.g. a 5.1 video downmixed to stereo
+        # often has surround content shifted toward one side, which would pan
+        # the narrator's voice toward the other side after a per-channel
+        # rescale.
+        video_stds = low_ram_std(video_arr)
+        ad_stds = low_ram_std(audio_desc_arr)
+        ad_level = float(np.mean(ad_stds))
+        if ad_level < 1.0:
+          # AD audio is effectively silent (RMS < 1 int16 unit). Skipping gain
+          # match prevents inf/NaN from corrupting the mux; the alignment that
+          # produced these times will fail downstream anyway, but at least the
+          # original video audio is left intact.
+          print(f"  WARNING: AD audio near-silent (RMS {ad_level:.2f}), skipping gain match")
+        else:
+          gain = float(np.mean(video_stds)) / ad_level
+          # Clamp pathological gains. Real-world AD vs broadcast video sits
+          # within roughly 0.1x-10x; anything beyond that is a sign the AD or
+          # the source is degenerate and we shouldn't blow out the output.
+          gain = max(0.01, min(100.0, gain))
+          total = audio_desc_arr.shape[1]
+          for start in range(0, total, _BOUNDED_PASS_FRAMES):
+            stop = min(start + _BOUNDED_PASS_FRAMES, total)
+            audio_desc_arr[:, start:stop] *= gain
+            audio_desc_arr.flush()
 
-      # Sanitise non-finite samples BEFORE computing the peak: a single
-      # NaN/inf would make `peak` non-finite, `peak > limit` would evaluate
-      # to False or True with garbage `limit/peak`, and the int16 cast at
-      # output write time would emit undefined samples (loud digital pops).
-      # Zero the offending samples — they're either rare interpolation
-      # residue (silent, OK) or evidence of a pathological alignment we
-      # shouldn't be muxing anyway (preferable to a loud glitch).
-      finite_mask = np.isfinite(video_arr)
-      if not finite_mask.all():
-        bad = video_arr.size - int(finite_mask.sum())
-        print(f"  WARNING: zeroing {bad} non-finite sample(s) before peak limit")
-        video_arr[~finite_mask] = 0.0
+        replace_aligned_segments(video_arr, audio_desc_arr, audio_desc_times, video_times, no_pitch_correction,
+                                 scratch_dir=out_dir_for_tmp)
+        del audio_desc_arr
 
-      # Prevent peaking by attenuating to within ±32,766 if and only if the
-      # signal already exceeds that range. Unconditionally scaling to peak
-      # would raise the *whole episode's* gain whenever the loudest sample
-      # is below full-scale, and lower it whenever a single seam crossfade
-      # produced a transient overshoot — both perceived as inconsistent
-      # loudness vs. the original.
-      peak = float(np.max(np.abs(video_arr)))
-      limit = 2**15 - 2.0
-      if peak > limit:
-        video_arr *= limit / peak
+        # Sanitise non-finite samples BEFORE computing the peak: a single
+        # NaN/inf would make `peak` non-finite, `peak > limit` would evaluate
+        # to False or True with garbage `limit/peak`, and the int16 cast at
+        # output write time would emit undefined samples (loud digital pops).
+        # Zero the offending samples — they're either rare interpolation
+        # residue (silent, OK) or evidence of a pathological alignment we
+        # shouldn't be muxing anyway (preferable to a loud glitch).
+        #
+        # Both this and the peak limit run in bounded slices: the full-array
+        # isfinite mask and np.abs copy were each the size of the movie's
+        # audio. Per-slice maxima reduce to the identical global peak and the
+        # scale is a single scalar, so output samples are unchanged.
+        bad = 0
+        peak = 0.0
+        total = video_arr.shape[1]
+        for start in range(0, total, _BOUNDED_PASS_FRAMES):
+          stop = min(start + _BOUNDED_PASS_FRAMES, total)
+          chunk = video_arr[:, start:stop]
+          finite_mask = np.isfinite(chunk)
+          if not finite_mask.all():
+            bad += chunk.size - int(finite_mask.sum())
+            chunk[~finite_mask] = 0.0
+          peak = max(peak, float(np.max(np.abs(chunk))))
+        if bad:
+          print(f"  WARNING: zeroing {bad} non-finite sample(s) before peak limit")
 
-      if dry_run:
-        print(f"  [dry run] would write: {output_filename}")
-        del video_arr
-      else:
-        print("  processing output file...                   \r", end='')
-        try:
-          write_replaced_media_to_disk(tmp_output_filename, video_arr, None if has_audio_extension else video_file,
-                                       median_slope=median_slope)
-          _atomic_finalize()
-        except Exception:
-          _cleanup_tmp()
-          raise
-        finally:
+        # Prevent peaking by attenuating to within ±32,766 if and only if the
+        # signal already exceeds that range. Unconditionally scaling to peak
+        # would raise the *whole episode's* gain whenever the loudest sample
+        # is below full-scale, and lower it whenever a single seam crossfade
+        # produced a transient overshoot — both perceived as inconsistent
+        # loudness vs. the original.
+        limit = 2**15 - 2.0
+        if peak > limit:
+          scale = limit / peak
+          for start in range(0, total, _BOUNDED_PASS_FRAMES):
+            stop = min(start + _BOUNDED_PASS_FRAMES, total)
+            video_arr[:, start:stop] *= scale
+            video_arr.flush()
+
+        if dry_run:
+          print(f"  [dry run] would write: {output_filename}")
           del video_arr
+        else:
+          print("  processing output file...                   \r", end='')
+          try:
+            write_replaced_media_to_disk(tmp_output_filename, video_arr, None if has_audio_extension else video_file,
+                                         median_slope=median_slope)
+            _atomic_finalize()
+          except Exception:
+            _cleanup_tmp()
+            raise
+          finally:
+            del video_arr
+      finally:
+        for scratch_path in scratch_paths:
+          try:
+            os.remove(scratch_path)
+          except OSError:
+            pass
     else:
       video_offset = video_times[0] - audio_desc_times[0]
       # to make ffmpeg cut at the last keyframe before the audio starts, use a timestamp after it
