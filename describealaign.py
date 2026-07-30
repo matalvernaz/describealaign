@@ -394,7 +394,12 @@ def _default_audio_cache_dir():
 
 # Total cache size cap (bytes). When writing a new entry would exceed this,
 # the oldest-by-mtime entries are evicted until the new write fits.
-AUDIO_CACHE_SIZE_BYTES = 4 * 1024 * 1024 * 1024  # 4 GB
+# Overridable because a movie-scale entry is ~2.4 GB: under the 4 GB default
+# two movies can't coexist, so a stretch-path re-parse (meant to be a cache
+# hit) evicts and re-decodes. Long-movie deployments should set the env to
+# ~3x their largest entry.
+AUDIO_CACHE_SIZE_BYTES = int(os.environ.get('DESCRIBEALAIGN_AUDIO_CACHE_BYTES',
+                                            4 * 1024 * 1024 * 1024))
 
 
 def _audio_cache_key(media_file, num_channels):
