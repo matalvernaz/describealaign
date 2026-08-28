@@ -402,17 +402,24 @@ AUDIO_CACHE_SIZE_BYTES = int(os.environ.get('DESCRIBEALAIGN_AUDIO_CACHE_BYTES',
                                             4 * 1024 * 1024 * 1024))
 
 
-def _audio_cache_key(media_file, num_channels):
+def _audio_cache_key(media_file, num_channels, honor_pts=True):
   """Cache key combining (canonical path, mtime, size, sample-rate, channels).
 
   mtime+size catches every edit short of a file being rewritten with the
-  exact same length and timestamp — won't happen in any real workflow."""
+  exact same length and timestamp — won't happen in any real workflow.
+
+  The two decode modes (see ``_stream_decode_to_npy``) produce different
+  sample streams for timestamp-damaged files, so ``honor_pts=False`` gets a
+  distinct key. The default mode keeps the historical fingerprint so
+  pre-existing cache entries stay valid."""
   abs_path = os.path.abspath(media_file)
   try:
     st = os.stat(abs_path)
   except OSError:
     return None
   fingerprint = f"{abs_path}|{st.st_size}|{st.st_mtime_ns}|{AUDIO_SAMPLE_RATE}|{num_channels}"
+  if not honor_pts:
+    fingerprint += "|seq"
   return hashlib.sha256(fingerprint.encode('utf-8')).hexdigest()[:32]
 
 
@@ -451,7 +458,7 @@ _DECODE_READ_BYTES = 8 * 1024 * 1024
 _DECODE_COPY_FRAMES = 4 * 1024 * 1024
 
 
-def _stream_decode_to_npy(media_file, num_channels, npy_path):
+def _stream_decode_to_npy(media_file, num_channels, npy_path, honor_pts=True):
   """Decode the first audio track of *media_file* to a ``(channels, samples)``
   C-order float32 ``.npy`` at *npy_path*, never holding the track in memory.
 
@@ -461,13 +468,23 @@ def _stream_decode_to_npy(media_file, num_channels, npy_path):
   The .npy layout matches what ``np.save`` historically wrote for these
   arrays, so pre-existing cache entries stay readable.
 
+  ``honor_pts=True`` conforms the output to the stream's timestamps
+  (``aresample=async=1`` silence-fills PTS gaps, ``first_pts=0`` anchors the
+  start) — required for a container's audio track, which must stay on the
+  video timeline. ``honor_pts=False`` decodes frames sequentially and
+  ignores timestamps entirely: the right mode for a standalone AD file,
+  whose PTS carry no meaning for alignment and, when damaged, make async
+  gap-filling inflate the decode with minutes of fabricated silence.
+
   Returns the per-channel sample count. Raises RuntimeError on ffmpeg
   failure, a trailing partial frame, or an empty decode.
   """
   bytes_per_frame = 2 * num_channels
-  ffmpeg_command = ffmpeg.input(media_file).output('-', format='s16le', acodec='pcm_s16le',
-                                                   af='aresample=async=1:first_pts=0', map='0:a:0',
-                                                   ac=num_channels, ar=AUDIO_SAMPLE_RATE, loglevel='error')
+  output_kwargs = dict(format='s16le', acodec='pcm_s16le', map='0:a:0',
+                       ac=num_channels, ar=AUDIO_SAMPLE_RATE, loglevel='error')
+  if honor_pts:
+    output_kwargs['af'] = 'aresample=async=1:first_pts=0'
+  ffmpeg_command = ffmpeg.input(media_file).output('-', **output_kwargs)
   args = ffmpeg_command.compile(cmd=get_ffmpeg())
   proc = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
@@ -572,7 +589,7 @@ def _writable_scratch_copy(src_arr, scratch_dir, tag):
 
 
 # read audio from file with ffmpeg into a read-only disk-backed memmap
-def parse_audio_from_file(media_file, num_channels=2, cache_dir=None):
+def parse_audio_from_file(media_file, num_channels=2, cache_dir=None, honor_pts=True):
   # retrieve only the first audio track, injecting silence/trimming to force timestamps to match up
   # for example, when the video starts before the audio this fills that starting gap with silence
 
@@ -586,7 +603,7 @@ def parse_audio_from_file(media_file, num_channels=2, cache_dir=None):
   # critical for any retry or tweak-and-rerun workflow.
   if cache_dir is None:
     cache_dir = _default_audio_cache_dir()
-  cache_key = _audio_cache_key(media_file, num_channels)
+  cache_key = _audio_cache_key(media_file, num_channels, honor_pts)
   cache_path = os.path.join(cache_dir, f"{cache_key}.npy") if cache_key else None
   if cache_path and os.path.exists(cache_path):
     try:
@@ -607,7 +624,7 @@ def parse_audio_from_file(media_file, num_channels=2, cache_dir=None):
 
   decode_target = cache_path + '.decode'
   try:
-    _stream_decode_to_npy(media_file, num_channels, decode_target)
+    _stream_decode_to_npy(media_file, num_channels, decode_target, honor_pts)
     _evict_until_fits(cache_dir, os.path.getsize(decode_target))
     os.replace(decode_target, cache_path)
   finally:
@@ -2092,7 +2109,11 @@ def combine(video, audio, stretch_audio=False, yes=False, prepend="ad_", no_pitc
 
     _t = time.monotonic()
     print("  reading audio file...       \r", end='')
-    audio_desc_arr = parse_audio_from_file(audio_desc_file, num_channels)
+    # honor_pts=False: the AD file's own timestamps are irrelevant (alignment
+    # maps AD samples to video time itself), and broadcast-rip MP3s with
+    # damaged PTS otherwise get silence-stuffed into a multiple of their real
+    # length by the async resampler, poisoning the alignment.
+    audio_desc_arr = parse_audio_from_file(audio_desc_file, num_channels, honor_pts=False)
     print(f"  read audio ({time.monotonic() - _t:.1f}s)          ")
 
     _t = time.monotonic()
@@ -2184,8 +2205,11 @@ def combine(video, audio, stretch_audio=False, yes=False, prepend="ad_", no_pitc
         video_arr, scratch_path = _writable_scratch_copy(
             parse_audio_from_file(video_file, num_channels), out_dir_for_tmp, 'video')
         scratch_paths.append(scratch_path)
+        # honor_pts must match the feature-pass decode above so this re-parse
+        # is the intended cache hit (same key) and stretches the same samples.
         audio_desc_arr, scratch_path = _writable_scratch_copy(
-            parse_audio_from_file(audio_desc_file, num_channels), out_dir_for_tmp, 'ad')
+            parse_audio_from_file(audio_desc_file, num_channels, honor_pts=False),
+            out_dir_for_tmp, 'ad')
         scratch_paths.append(scratch_path)
 
         # Per-channel std using the variance-decomposition identity, without
