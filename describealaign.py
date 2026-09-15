@@ -65,6 +65,21 @@ MAX_RATE_RATIO_DIFF_ALIGN = .1
 MIN_DURATION_TO_REPLACE_SECONDS = 2
 JUST_NOTICEABLE_DIFF_IN_FREQ_RATIO = .005
 MIN_STRETCH_OFFSET = 30
+# Pass 2 of align() re-scores every candidate line sample-by-sample with a
+# weak per-sample match quality and pays a flat penalty to jump between lines.
+# When the two inputs are different cuts of the same film, a line the pass-1
+# hash matcher confirmed over tens of seconds can lose to "stay on the old
+# line, then skip" — the skip costs the same whether it drops 0.1 s or 30 s
+# of narration, while a wrong line keeps collecting small positive scores
+# through non-distinctive content. Every pass-2 sample that pass 1 actually
+# matched (a point of the fitted line cluster) earns this bonus, so a line
+# backed by N confirmed matches is worth N * bonus to the path and cannot be
+# skipped cheaply. Chosen so ~100 confirmed matches (~35 s of matched
+# content) outweigh one line jump. Verified on Scary Movie 3 (unrated video
+# vs theatrical TTS description): misplaced narration 19.5 s -> 0, dropped
+# description 33 s -> 2.8 s; single-cut alignments are unaffected because a
+# constant added along the only line changes no decision.
+CONFIRMED_MATCH_BONUS = 10.0
 
 # Crossfade applied at the boundary between an AD-replaced span and an
 # original-audio span (segments skipped because their slope/duration falls
@@ -1560,6 +1575,26 @@ def get_freq_bands(arr):
     arr = band_bottom
   return freq_bands
 
+def confirmed_match_bonuses(confirmed_x, start, length, bonus=None):
+  """
+  Per-sample pass-2 bonus for one candidate line.
+
+  ``confirmed_x`` are the (rounded, integer) audio indices of the pass-1
+  matches that make up the line's cluster; ``start`` is the first audio
+  index of the line's extended range and ``length`` its sample count.
+  Returns a float array of ``length`` with ``bonus`` at every confirmed index
+  that falls inside the range and 0 elsewhere. Indices outside the range are
+  ignored rather than wrapped.
+  """
+  if bonus is None:
+    bonus = CONFIRMED_MATCH_BONUS
+  bonuses = np.zeros(length)
+  idx = np.asarray(confirmed_x, dtype=int) - int(start)
+  idx = idx[(idx >= 0) & (idx < length)]
+  bonuses[idx] = bonus
+  return bonuses
+
+
 def align(video_features, audio_desc_features, video_energy, audio_desc_energy):
   samples_per_node = 210 // TIMESTEPS_PER_SECOND
   hann_window_unnormed = scipy.signal.windows.hann(2*samples_per_node+1)[1:-1]
@@ -1898,6 +1933,7 @@ def align(video_features, audio_desc_features, video_energy, audio_desc_energy):
   points = [[] for i in range(len(audio_desc_features_scaled))]
   seen_points = set()
   for cluster_index, (x, offset, slope) in enumerate(line_clusters):
+    confirmed_x = np.round(x).astype(int)
     limits = get_x_limits(x, offset, slope, extend_horiz=0)
     if limits[1] < limits[0] + 5:
       continue
@@ -1922,11 +1958,12 @@ def align(video_features, audio_desc_features, video_energy, audio_desc_energy):
     quals *= np.clip(video_match[:,0] + 2.5 - video_max_energy, 0, 1)
     quals += np.clip(audio_match[:,0] + 2.5 - audio_desc_max_energy, 0, 1) * .1
     energy_diffs = audio_match[:,0] - video_match[:,0]
-    for i, j, qual in zip(x.tolist(), y.tolist(), quals.tolist()):
+    bonuses = confirmed_match_bonuses(confirmed_x, limits[0], len(x))
+    for i, j, qual, bonus in zip(x.tolist(), y.tolist(), quals.tolist(), bonuses.tolist()):
       point = (i, int(j))
       if point not in seen_points:
         seen_points.add(point)
-        points[i].append((j, cluster_index, qual))
+        points[i].append((j, cluster_index, qual, bonus))
   del seen_points
   del video_interp
   points = [sorted(point) for point in points]
@@ -1941,7 +1978,7 @@ def align(video_features, audio_desc_features, video_energy, audio_desc_energy):
   forward_min = list(itertools.accumulate(reversed_min_points, min))[::-1]
   del reversed_min_points
   for i in range(len(audio_desc_features_scaled)):
-    for j, cluster_index, qual in points[i]:
+    for j, cluster_index, qual, bonus in points[i]:
       cur_index = best_so_far.bisect_right((j,))
       prev_j, prev_i, prev_cluster_index, prev_qual, best_prev_cum_qual = best_so_far[cur_index-1]
       cluster_last = clusters_best_so_far[cluster_index]
@@ -1956,7 +1993,9 @@ def align(video_features, audio_desc_features, video_energy, audio_desc_energy):
            prev_node[0] <= j and \
            prev_node[4] >= best_prev_cum_qual:
           prev_j, prev_i, prev_cluster_index, prev_qual, best_prev_cum_qual = prev_node
-      cum_qual = best_prev_cum_qual + qual
+      # The bonus steers the path (cum_qual) only; the stored per-node qual
+      # stays the raw match quality so similarity_percent is unchanged.
+      cum_qual = best_prev_cum_qual + qual + bonus
       prev_cache[int(j)] = (j, i, cluster_index, qual, cum_qual)
       cum_qual_jump = cum_qual - 1000
       if best_so_far[cur_index-1][4] < cum_qual_jump:

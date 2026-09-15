@@ -1,6 +1,6 @@
 # describealaign
 
-> **Note:** describealaign is a maintained fork of [describealign](https://github.com/julbean/describealign) by Julian Brown. It carries fixes for PAL/NTSC source mismatches, commercial-break seam crossfades, structured (`--json`) output, parsed-audio caching, and a property-based test suite. License remains GPLv3.
+> **Note:** describealaign is a maintained fork of [describealign](https://github.com/julbean/describealign) by Julian Brown. It carries fixes for PAL/NTSC source mismatches, commercial-break seam crossfades, different-cut sources (pass-2 anchoring to confirmed matches, so an unrated video against a theatrical description no longer plays narration early), structured (`--json`) output, parsed-audio caching, and a property-based test suite. License remains GPLv3.
 
 Combines videos with matching audio files (e.g. audio descriptions). Works by aligning parts of the audio file to matching parts of the video's sound.
 
