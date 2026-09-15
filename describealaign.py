@@ -65,6 +65,16 @@ MAX_RATE_RATIO_DIFF_ALIGN = .1
 MIN_DURATION_TO_REPLACE_SECONDS = 2
 JUST_NOTICEABLE_DIFF_IN_FREQ_RATIO = .005
 MIN_STRETCH_OFFSET = 30
+# Interleave window for the output muxes, in microseconds. The muxes used to
+# pass max_interleave_delta=0, which tells libavformat to keep buffering until
+# it holds a packet for EVERY output stream. A Blu-ray remux with a dozen sparse
+# PGS subtitle tracks (some silent for minutes, some empty) then made ffmpeg
+# buffer the whole 25 GB source in RAM: measured 5.2 GB after 95 s, and inside
+# describarr's 7 GiB container the kernel killed ffmpeg on every PAL-rate remux
+# (Snow White and the Huntsman, The Hangover, Horrible Bosses 2, 2026-09-15).
+# 30 s bounds the buffer to a few hundred MB at Blu-ray bitrates while still
+# absorbing the late subtitle packets the old setting was guarding against.
+MUX_MAX_INTERLEAVE_DELTA_US = 30_000_000
 # Pass 2 of align() re-scores every candidate line sample-by-sample with a
 # weak per-sample match quality and pays a flat penalty to jump between lines.
 # When the two inputs are different cuts of the same film, a line the pass-1
@@ -1337,7 +1347,7 @@ def write_passthrough_media_to_disk(output_filename, video_file, audio_desc_file
                           itsoffset=f'{max(0, -video_offset):.6f}', dn=None)
   out_kwargs = {
     'acodec': 'copy', 'vcodec': 'copy', 'scodec': 'copy',
-    'max_interleave_delta': '0', 'loglevel': 'error',
+    'max_interleave_delta': str(MUX_MAX_INTERLEAVE_DELTA_US), 'loglevel': 'error',
     'disposition:a:0': 'default+visual_impaired',
     'metadata:s:a:0': 'title=AD',
   }
@@ -1391,12 +1401,14 @@ def write_replaced_media_to_disk(output_filename, media_arr, video_file=None, au
       write_command = ffmpeg.output(media_input, output_filename, loglevel='error').overwrite_output()
     else:
       original_video = ffmpeg.input(video_file, dn=None)
-      # "-max_interleave_delta 0" is sometimes necessary to fix an .mkv bug that freezes audio/video:
-      #   ffmpeg bug warning: [matroska @ 0000000002c814c0] Starting new cluster due to timestamp
-      # more info about the bug and fix: https://reddit.com/r/ffmpeg/comments/efddfs/
+      # max_interleave_delta: a bounded window (see MUX_MAX_INTERLEAVE_DELTA_US).
+      # The original code used 0 to dodge an .mkv "Starting new cluster due to
+      # timestamp" freeze (https://reddit.com/r/ffmpeg/comments/efddfs/), but 0
+      # means "buffer until every stream has a packet" and that is unbounded RAM
+      # on remuxes with sparse subtitle tracks.
       out_kwargs = {
         'acodec': 'copy', 'vcodec': 'copy', 'scodec': 'copy',
-        'max_interleave_delta': '0', 'loglevel': 'error',
+        'max_interleave_delta': str(MUX_MAX_INTERLEAVE_DELTA_US), 'loglevel': 'error',
         'c:a:0': 'aac',
         'disposition:a:0': 'default+visual_impaired',
         'metadata:s:a:0': 'title=AD',
@@ -1433,7 +1445,7 @@ def write_replaced_media_to_disk(output_filename, media_arr, video_file=None, au
     # set both pts and dts simultaneously in video manually, as ts= does not do the same thing
     out_kwargs = {
       'acodec': 'copy', 'c:a:0': audio_codec, 'vcodec': 'copy', 'scodec': 'copy',
-      'max_interleave_delta': '0', 'loglevel': 'error',
+      'max_interleave_delta': str(MUX_MAX_INTERLEAVE_DELTA_US), 'loglevel': 'error',
       'strict': standards, 'movflags': 'frag_keyframe',
       'bsf:v': f'setts=pts=\'{setts_cmd}\':dts=\'{setts_cmd}\'',
       'disposition:a:0': 'default+visual_impaired',
