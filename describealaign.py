@@ -65,6 +65,12 @@ MAX_RATE_RATIO_DIFF_ALIGN = .1
 MIN_DURATION_TO_REPLACE_SECONDS = 2
 JUST_NOTICEABLE_DIFF_IN_FREQ_RATIO = .005
 MIN_STRETCH_OFFSET = 30
+# The pitch-preserving stretch correlates windows of this many samples and
+# needs three of them. A shorter replaced segment (a millisecond connector the
+# gap fill marked, Heartland S10E14) is interpolated instead; a pitch shift
+# that brief is inaudible.
+STRETCH_WINDOW_SAMPLES = 512
+MIN_STRETCH_INPUT_SAMPLES = 3 * STRETCH_WINDOW_SAMPLES - 1
 # Interleave window for the output muxes, in microseconds. The muxes used to
 # pass max_interleave_delta=0, which tells libavformat to keep buffering until
 # it holds a packet for EVERY output stream. A Blu-ray remux with a dozen sparse
@@ -907,7 +913,7 @@ def replace_aligned_segments(video_arr, audio_desc_arr, audio_desc_times, video_
   # the output matrix is truncated to the valid square with positive offsets
   # if negative=True, it is truncated to the valid square with negative offsets
   # subsequent yields are the adjacent square following the previously yielded one
-  def get_pearson_corrs_generator(input, negative, jumps, window_size=512):
+  def get_pearson_corrs_generator(input, negative, jumps, window_size=STRETCH_WINDOW_SAMPLES):
     # processing the entire vector at once is faster, but uses too much memory
     # instead, parse the input vector in pieces with a recursive call
     max_cached_chunks = 50
@@ -952,7 +958,7 @@ def replace_aligned_segments(video_arr, audio_desc_arr, audio_desc_times, video_
     for chunk_index in range(0, input.shape[1] // window_size):
       yield pearson_corrs[chunk_index*window_size:(chunk_index+1)*window_size]
   
-  def stretch(input, output, window_size=512, max_drift=512*3):
+  def stretch(input, output, window_size=STRETCH_WINDOW_SAMPLES, max_drift=512*3):
     drift_window_size = max_drift * 2 + 1
     num_input_samples = input.shape[1]
     num_output_samples = output.shape[1]
@@ -1205,14 +1211,16 @@ def replace_aligned_segments(video_arr, audio_desc_arr, audio_desc_times, video_
       elapsed = time.monotonic() - _stretch_start
       eta_str = f"ETA {elapsed * (100 - progress) / progress:4.0f}s" if progress > 0 else "ETA --"
       print(f"  stretching audio:{progress:3d}%  {eta_str}            \r", end='')
+    audio_desc_arr_slice = audio_desc_arr[:,slice(*x_samples[i:i+2])]
     # only apply pitch correction if the difference would be noticeable
     if no_pitch_correction or np.abs(1 - slopes[i]) <= JUST_NOTICEABLE_DIFF_IN_FREQ_RATIO or \
-       abs(total_offset_samples[i]) < MIN_STRETCH_OFFSET:
+       abs(total_offset_samples[i]) < MIN_STRETCH_OFFSET or \
+       audio_desc_arr_slice.shape[1] < MIN_STRETCH_INPUT_SAMPLES:
       # construct a stretched audio description waveform using the quadratic interpolator
       audio_desc_arr_interp(float(x_samples[i]), float(x_samples[i+1]),
                             int(diff_y_samples[i]), video_arr_slice)
     else:
-      stretch(audio_desc_arr[:,slice(*x_samples[i:i+2])], video_arr_slice)
+      stretch(audio_desc_arr_slice, video_arr_slice)
 
   # Restore original video audio between the silence-adjusted end and the
   # nominal segment end, undoing the AD replacement in that tail region so
