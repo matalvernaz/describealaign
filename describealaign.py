@@ -1310,29 +1310,79 @@ def _probe_stream_layout(video_file):
 
   Keys:
     audio_titles:    list[str] of per-audio-stream titles ('' if untagged)
+    audio_languages: list[str] of per-audio-stream language tags ('' if untagged)
     subtitle_codecs: list[str] of per-subtitle-stream codec_name values
     n_attachment:    int, count of attachment streams (fonts etc.)
   """
   probe = ffmpeg.probe(video_file, cmd=get_ffprobe())
   audio_titles = []
+  audio_languages = []
   subtitle_codecs = []
   n_attachment = 0
   for s in probe['streams']:
     ctype = s.get('codec_type')
     if ctype == 'audio':
       audio_titles.append(s.get('tags', {}).get('title', ''))
+      audio_languages.append(s.get('tags', {}).get('language', ''))
     elif ctype == 'subtitle':
       subtitle_codecs.append(s.get('codec_name', ''))
     elif ctype == 'attachment':
       n_attachment += 1
   return {
     'audio_titles': audio_titles,
+    'audio_languages': audio_languages,
     'subtitle_codecs': subtitle_codecs,
     'n_attachment': n_attachment,
   }
 
 
-def write_passthrough_media_to_disk(output_filename, video_file, audio_desc_file, video_offset):
+# What ffmpeg writes when it is told no language, and the absent tag. Neither
+# says what the audio is in.
+_UNDETERMINED_LANGUAGES = frozenset({'', 'und'})
+
+
+def ad_language_code(value):
+  """argparse type for --ad_language: a three-letter ISO 639-2 code, e.g. eng."""
+  code = value.strip().lower()
+  if len(code) != 3 or not (code.isascii() and code.isalpha()):
+    raise argparse.ArgumentTypeError(f"not a three-letter ISO 639-2 language code: {value!r}")
+  return code
+
+
+def _ad_track_language(layout, ad_language=None):
+  """The language to give the AD track, or None to leave it unlabelled.
+
+  An explicit ad_language wins. Otherwise the AD takes the language of the
+  video's first audio track: the track the alignment matched against and, for
+  almost every description, the language it is narrated in.
+
+  An unlabelled AD track is not harmless. A player that chooses subtitles by
+  comparing the audio's language with the viewer's (Jellyfin's Smart mode)
+  reads no language as foreign, and turns on full subtitles in the viewer's own
+  language over audio they already understand.
+  """
+  if ad_language:
+    return ad_language
+  languages = layout.get('audio_languages') or []
+  first = (languages[0] if languages else '').strip().lower()
+  return None if first in _UNDETERMINED_LANGUAGES else first
+
+
+def _label_ad_track(out_kwargs, language):
+  """Title the AD track and, when the language is known, label it.
+
+  Every mux below maps the AD first, so it is output stream 0. ffmpeg-python
+  emits one flag per keyword and turns a list value into a single string, so
+  the second tag on that stream goes through the equivalent `s:0` specifier
+  rather than a second `s:a:0`.
+  """
+  out_kwargs['metadata:s:a:0'] = 'title=AD'
+  if language:
+    out_kwargs['metadata:s:0'] = f'language={language}'
+
+
+def write_passthrough_media_to_disk(output_filename, video_file, audio_desc_file, video_offset,
+                                    ad_language=None):
   """
   Mux the AD source file directly into the output, bit-perfect, with at
   most a constant ``itsoffset`` to handle the start delay. No decode, no
@@ -1357,8 +1407,8 @@ def write_passthrough_media_to_disk(output_filename, video_file, audio_desc_file
     'acodec': 'copy', 'vcodec': 'copy', 'scodec': 'copy',
     'max_interleave_delta': str(MUX_MAX_INTERLEAVE_DELTA_US), 'loglevel': 'error',
     'disposition:a:0': 'default+visual_impaired',
-    'metadata:s:a:0': 'title=AD',
   }
+  _label_ad_track(out_kwargs, _ad_track_language(layout, ad_language))
   for i, title in enumerate(audio_stream_titles):
     label = title or ('original' if n_audio == 1 else f'audio {i + 1}')
     out_kwargs[f'disposition:a:{i + 1}'] = '0'
@@ -1386,7 +1436,7 @@ def write_passthrough_media_to_disk(output_filename, video_file, audio_desc_file
 # outputs a new media file with the replaced audio (which includes audio descriptions)
 def write_replaced_media_to_disk(output_filename, media_arr, video_file=None, audio_desc_file=None,
                                  setts_cmd=None, video_offset=None, after_start_key_frame=None,
-                                 median_slope=1.):
+                                 median_slope=1., ad_language=None):
   # probe source video for the full preservable stream layout (audio titles,
   # subtitle codecs, attachment count) so every track is mapped through.
   if video_file is not None:
@@ -1394,10 +1444,12 @@ def write_replaced_media_to_disk(output_filename, media_arr, video_file=None, au
     audio_stream_titles = layout['audio_titles']
     subtitle_codecs = layout['subtitle_codecs']
     n_attachment = layout['n_attachment']
+    ad_track_language = _ad_track_language(layout, ad_language)
   else:
     audio_stream_titles = []
     subtitle_codecs = []
     n_attachment = 0
+    ad_track_language = None
   n_audio = len(audio_stream_titles)
   n_subtitle = len(subtitle_codecs)
 
@@ -1419,8 +1471,8 @@ def write_replaced_media_to_disk(output_filename, media_arr, video_file=None, au
         'max_interleave_delta': str(MUX_MAX_INTERLEAVE_DELTA_US), 'loglevel': 'error',
         'c:a:0': 'aac',
         'disposition:a:0': 'default+visual_impaired',
-        'metadata:s:a:0': 'title=AD',
       }
+      _label_ad_track(out_kwargs, ad_track_language)
       for i, title in enumerate(audio_stream_titles):
         label = title or ('original' if n_audio == 1 else f'audio {i + 1}')
         out_kwargs[f'disposition:a:{i + 1}'] = '0'
@@ -1457,8 +1509,8 @@ def write_replaced_media_to_disk(output_filename, media_arr, video_file=None, au
       'strict': standards, 'movflags': 'frag_keyframe',
       'bsf:v': f'setts=pts=\'{setts_cmd}\':dts=\'{setts_cmd}\'',
       'disposition:a:0': 'default+visual_impaired',
-      'metadata:s:a:0': 'title=AD',
     }
+    _label_ad_track(out_kwargs, ad_track_language)
     # Apply the subtitle retime filter ONLY to text-based subtitles. Bitmap
     # subtitle codecs (PGS/DVDSub/etc) carry their own presentation timestamps
     # inside the packets — ffmpeg's `setts` bitstream filter either errors
@@ -2080,7 +2132,8 @@ def align(video_features, audio_desc_features, video_energy, audio_desc_energy):
 # combines videos with matching audio files (e.g. audio descriptions)
 # this is the main function of this script, it calls the other functions in order
 def combine(video, audio, stretch_audio=False, yes=False, prepend="ad_", no_pitch_correction=False,
-            output_dir=default_output_dir, alignment_dir=default_alignment_dir, dry_run=False):
+            output_dir=default_output_dir, alignment_dir=default_alignment_dir, dry_run=False,
+            ad_language=None):
   video_files, has_audio_extensions = get_sorted_filenames(video, VIDEO_EXTENSIONS, AUDIO_EXTENSIONS)
   
   if yes == False and sum(has_audio_extensions) > 0:
@@ -2247,7 +2300,8 @@ def combine(video, audio, stretch_audio=False, yes=False, prepend="ad_", no_pitc
       else:
         try:
           write_passthrough_media_to_disk(tmp_output_filename, video_file, audio_desc_file,
-                                           video_offset=passthrough_offset)
+                                           video_offset=passthrough_offset,
+                                           ad_language=ad_language)
           _atomic_finalize()
         except Exception:
           _cleanup_tmp()
@@ -2364,7 +2418,7 @@ def combine(video, audio, stretch_audio=False, yes=False, prepend="ad_", no_pitc
           print("  processing output file...                   \r", end='')
           try:
             write_replaced_media_to_disk(tmp_output_filename, video_arr, None if has_audio_extension else video_file,
-                                         median_slope=median_slope)
+                                         median_slope=median_slope, ad_language=ad_language)
             _atomic_finalize()
           except Exception:
             _cleanup_tmp()
@@ -2389,7 +2443,7 @@ def combine(video, audio, stretch_audio=False, yes=False, prepend="ad_", no_pitc
         try:
           write_replaced_media_to_disk(tmp_output_filename, None, video_file, audio_desc_file,
                                        setts_cmd, video_offset, after_start_key_frame,
-                                       median_slope=median_slope)
+                                       median_slope=median_slope, ad_language=ad_language)
           _atomic_finalize()
         except Exception:
           _cleanup_tmp()
@@ -3046,6 +3100,10 @@ def command_line_interface():
                       help='Directory alignment data and plots are saved to. Default is "alignment_plots"')
   parser.add_argument('--dry-run', action='store_true',
                       help='Run alignment and produce plots without writing output media files.')
+  parser.add_argument('--ad_language', type=ad_language_code, default=None, metavar='CODE',
+                      help='ISO 639-2 language of the audio description track, e.g. eng. ' + \
+                           'Default is the language of the video\'s first audio track, ' + \
+                           'when it has one.')
   parser.add_argument('--watch', action='store_true',
                       help='Watch input directories for new file pairs and process them automatically.')
   parser.add_argument('--watch-interval', type=int, default=30, metavar='SECONDS',
@@ -3088,7 +3146,8 @@ def command_line_interface():
       while True:
         try:
           combine(args.video, args.audio, args.stretch_audio, True, args.prepend,
-                  args.no_pitch_correction, args.output_dir, args.alignment_dir, args.dry_run)
+                  args.no_pitch_correction, args.output_dir, args.alignment_dir, args.dry_run,
+                  ad_language=args.ad_language)
         except KeyboardInterrupt:
           print("\nWatch mode stopped.")
           break
@@ -3098,7 +3157,8 @@ def command_line_interface():
         time.sleep(args.watch_interval)
     else:
       combine(args.video, args.audio, args.stretch_audio, args.yes, args.prepend,
-              args.no_pitch_correction, args.output_dir, args.alignment_dir, args.dry_run)
+              args.no_pitch_correction, args.output_dir, args.alignment_dir, args.dry_run,
+              ad_language=args.ad_language)
   else:
     parser.print_usage()
 
