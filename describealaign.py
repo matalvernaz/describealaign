@@ -3135,8 +3135,8 @@ def command_line_interface():
                       help='Run alignment and produce plots without writing output media files.')
   parser.add_argument('--ad_language', type=ad_language_code, default=None, metavar='CODE',
                       help='ISO 639-2 language of the audio description track, e.g. eng. ' + \
-                           'Default is the language of the video\'s first audio track, ' + \
-                           'when it has one.')
+                           'Default is the language of the audio track aligned against ' + \
+                           '(the first, or the one --audio_stream names), when it has one.')
   parser.add_argument('--audio_stream', type=audio_stream_index, default=0, metavar='N',
                       help='Which of the video\'s audio streams to align against and fill ' + \
                            'the description\'s gaps from, counting from 0. Default 0, the ' + \
