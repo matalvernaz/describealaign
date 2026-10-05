@@ -90,6 +90,8 @@ describealaign opens in either light or dark mode depending on the OS's desktop 
 
 By default describealaign stretches video to fit audio descriptions, but the inverse is also possible: stretching the audio description to fit the video with the "--stretch_audio" argument. In both modes, all original audio tracks from the video are preserved in the output alongside the audio description track (which is set as the default).
 
+The alignment listens to the video's first audio track, and the description's gaps are filled from it. When that track is a dub (some "Dual Audio" releases put a foreign-language track first), pass "--audio_stream N" to use another, counting audio tracks from 0: "--audio_stream 1" for the second. Without "--ad_language", the description track then takes that track's language.
+
 When using --stretch_audio, the plot also shows which segments of audio were replaced:
 
 <img src="https://github.com/matalvernaz/describealaign/blob/main/readme_media/ask_dad_stretch_audio.png" alt="Ask Dad Stretch Audio Alignment" align="middle" width="50%"/>

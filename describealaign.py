@@ -433,7 +433,7 @@ AUDIO_CACHE_SIZE_BYTES = int(os.environ.get('DESCRIBEALAIGN_AUDIO_CACHE_BYTES',
                                             4 * 1024 * 1024 * 1024))
 
 
-def _audio_cache_key(media_file, num_channels, honor_pts=True):
+def _audio_cache_key(media_file, num_channels, honor_pts=True, audio_stream=0):
   """Cache key combining (canonical path, mtime, size, sample-rate, channels).
 
   mtime+size catches every edit short of a file being rewritten with the
@@ -442,7 +442,12 @@ def _audio_cache_key(media_file, num_channels, honor_pts=True):
   The two decode modes (see ``_stream_decode_to_npy``) produce different
   sample streams for timestamp-damaged files, so ``honor_pts=False`` gets a
   distinct key. The default mode keeps the historical fingerprint so
-  pre-existing cache entries stay valid."""
+  pre-existing cache entries stay valid.
+
+  A track other than the first (``audio_stream``) is different audio from the
+  same file, so it gets a key of its own; the first keeps the historical one.
+  Without this a file decoded once for its first track would hand that track
+  back when another is asked for."""
   abs_path = os.path.abspath(media_file)
   try:
     st = os.stat(abs_path)
@@ -451,6 +456,8 @@ def _audio_cache_key(media_file, num_channels, honor_pts=True):
   fingerprint = f"{abs_path}|{st.st_size}|{st.st_mtime_ns}|{AUDIO_SAMPLE_RATE}|{num_channels}"
   if not honor_pts:
     fingerprint += "|seq"
+  if audio_stream:
+    fingerprint += f"|a{audio_stream}"
   return hashlib.sha256(fingerprint.encode('utf-8')).hexdigest()[:32]
 
 
@@ -489,7 +496,7 @@ _DECODE_READ_BYTES = 8 * 1024 * 1024
 _DECODE_COPY_FRAMES = 4 * 1024 * 1024
 
 
-def _stream_decode_to_npy(media_file, num_channels, npy_path, honor_pts=True):
+def _stream_decode_to_npy(media_file, num_channels, npy_path, honor_pts=True, audio_stream=0):
   """Decode the first audio track of *media_file* to a ``(channels, samples)``
   C-order float32 ``.npy`` at *npy_path*, never holding the track in memory.
 
@@ -511,7 +518,7 @@ def _stream_decode_to_npy(media_file, num_channels, npy_path, honor_pts=True):
   failure, a trailing partial frame, or an empty decode.
   """
   bytes_per_frame = 2 * num_channels
-  output_kwargs = dict(format='s16le', acodec='pcm_s16le', map='0:a:0',
+  output_kwargs = dict(format='s16le', acodec='pcm_s16le', map=f'0:a:{audio_stream}',
                        ac=num_channels, ar=AUDIO_SAMPLE_RATE, loglevel='error')
   if honor_pts:
     output_kwargs['af'] = 'aresample=async=1:first_pts=0'
@@ -620,8 +627,9 @@ def _writable_scratch_copy(src_arr, scratch_dir, tag):
 
 
 # read audio from file with ffmpeg into a read-only disk-backed memmap
-def parse_audio_from_file(media_file, num_channels=2, cache_dir=None, honor_pts=True):
-  # retrieve only the first audio track, injecting silence/trimming to force timestamps to match up
+def parse_audio_from_file(media_file, num_channels=2, cache_dir=None, honor_pts=True, audio_stream=0):
+  # retrieve one audio track (the first, unless audio_stream names another),
+  # injecting silence/trimming to force timestamps to match up
   # for example, when the video starts before the audio this fills that starting gap with silence
 
   # The returned array is a READ-ONLY np.memmap: its pages live in the file
@@ -634,7 +642,7 @@ def parse_audio_from_file(media_file, num_channels=2, cache_dir=None, honor_pts=
   # critical for any retry or tweak-and-rerun workflow.
   if cache_dir is None:
     cache_dir = _default_audio_cache_dir()
-  cache_key = _audio_cache_key(media_file, num_channels, honor_pts)
+  cache_key = _audio_cache_key(media_file, num_channels, honor_pts, audio_stream)
   cache_path = os.path.join(cache_dir, f"{cache_key}.npy") if cache_key else None
   if cache_path and os.path.exists(cache_path):
     try:
@@ -655,7 +663,7 @@ def parse_audio_from_file(media_file, num_channels=2, cache_dir=None, honor_pts=
 
   decode_target = cache_path + '.decode'
   try:
-    _stream_decode_to_npy(media_file, num_channels, decode_target, honor_pts)
+    _stream_decode_to_npy(media_file, num_channels, decode_target, honor_pts, audio_stream)
     _evict_until_fits(cache_dir, os.path.getsize(decode_target))
     os.replace(decode_target, cache_path)
   finally:
@@ -1349,12 +1357,13 @@ def ad_language_code(value):
   return code
 
 
-def _ad_track_language(layout, ad_language=None):
+def _ad_track_language(layout, ad_language=None, audio_stream=0):
   """The language to give the AD track, or None to leave it unlabelled.
 
   An explicit ad_language wins. Otherwise the AD takes the language of the
-  video's first audio track: the track the alignment matched against and, for
-  almost every description, the language it is narrated in.
+  video's audio track the alignment matched against (the first, unless
+  audio_stream names another): for almost every description, the language it
+  is narrated in.
 
   An unlabelled AD track is not harmless. A player that chooses subtitles by
   comparing the audio's language with the viewer's (Jellyfin's Smart mode)
@@ -1364,8 +1373,27 @@ def _ad_track_language(layout, ad_language=None):
   if ad_language:
     return ad_language
   languages = layout.get('audio_languages') or []
-  first = (languages[0] if languages else '').strip().lower()
-  return None if first in _UNDETERMINED_LANGUAGES else first
+  matched = (languages[audio_stream] if audio_stream < len(languages) else '').strip().lower()
+  return None if matched in _UNDETERMINED_LANGUAGES else matched
+
+
+def audio_stream_index(value):
+  """argparse type for --audio_stream: a 0-based index among the audio streams."""
+  try:
+    index = int(value)
+  except ValueError:
+    raise argparse.ArgumentTypeError(f"not a whole number: {value!r}")
+  if index < 0:
+    raise argparse.ArgumentTypeError(f"must be 0 or more: {value!r}")
+  return index
+
+
+def _check_audio_stream(video_file, audio_stream):
+  """Refuse a track the file does not have, before any decode."""
+  n_audio = len(_probe_stream_layout(video_file)['audio_titles'])
+  if audio_stream >= n_audio:
+    raise RuntimeError(f"--audio_stream {audio_stream}, but {os.path.basename(video_file)} "
+                       f"has {n_audio} audio stream{'' if n_audio == 1 else 's'}")
 
 
 def _label_ad_track(out_kwargs, language):
@@ -1382,7 +1410,7 @@ def _label_ad_track(out_kwargs, language):
 
 
 def write_passthrough_media_to_disk(output_filename, video_file, audio_desc_file, video_offset,
-                                    ad_language=None):
+                                    ad_language=None, audio_stream=0):
   """
   Mux the AD source file directly into the output, bit-perfect, with at
   most a constant ``itsoffset`` to handle the start delay. No decode, no
@@ -1408,7 +1436,7 @@ def write_passthrough_media_to_disk(output_filename, video_file, audio_desc_file
     'max_interleave_delta': str(MUX_MAX_INTERLEAVE_DELTA_US), 'loglevel': 'error',
     'disposition:a:0': 'default+visual_impaired',
   }
-  _label_ad_track(out_kwargs, _ad_track_language(layout, ad_language))
+  _label_ad_track(out_kwargs, _ad_track_language(layout, ad_language, audio_stream))
   for i, title in enumerate(audio_stream_titles):
     label = title or ('original' if n_audio == 1 else f'audio {i + 1}')
     out_kwargs[f'disposition:a:{i + 1}'] = '0'
@@ -1436,7 +1464,7 @@ def write_passthrough_media_to_disk(output_filename, video_file, audio_desc_file
 # outputs a new media file with the replaced audio (which includes audio descriptions)
 def write_replaced_media_to_disk(output_filename, media_arr, video_file=None, audio_desc_file=None,
                                  setts_cmd=None, video_offset=None, after_start_key_frame=None,
-                                 median_slope=1., ad_language=None):
+                                 median_slope=1., ad_language=None, audio_stream=0):
   # probe source video for the full preservable stream layout (audio titles,
   # subtitle codecs, attachment count) so every track is mapped through.
   if video_file is not None:
@@ -1444,7 +1472,7 @@ def write_replaced_media_to_disk(output_filename, media_arr, video_file=None, au
     audio_stream_titles = layout['audio_titles']
     subtitle_codecs = layout['subtitle_codecs']
     n_attachment = layout['n_attachment']
-    ad_track_language = _ad_track_language(layout, ad_language)
+    ad_track_language = _ad_track_language(layout, ad_language, audio_stream)
   else:
     audio_stream_titles = []
     subtitle_codecs = []
@@ -2133,7 +2161,7 @@ def align(video_features, audio_desc_features, video_energy, audio_desc_energy):
 # this is the main function of this script, it calls the other functions in order
 def combine(video, audio, stretch_audio=False, yes=False, prepend="ad_", no_pitch_correction=False,
             output_dir=default_output_dir, alignment_dir=default_alignment_dir, dry_run=False,
-            ad_language=None):
+            ad_language=None, audio_stream=0):
   video_files, has_audio_extensions = get_sorted_filenames(video, VIDEO_EXTENSIONS, AUDIO_EXTENSIONS)
   
   if yes == False and sum(has_audio_extensions) > 0:
@@ -2199,6 +2227,8 @@ def combine(video, audio, stretch_audio=False, yes=False, prepend="ad_", no_pitc
       print("  WARNING: very long output path, ffmpeg may fail...")
 
     num_channels = 2 if stretch_audio else 1
+    if audio_stream:
+      _check_audio_stream(video_file, audio_stream)
     # Sequential feature extraction: decode one file, distil its (small)
     # features, release the mapping before touching the next file. Alignment
     # itself only needs the features, so no full-length audio stays resident
@@ -2206,7 +2236,7 @@ def combine(video, audio, stretch_audio=False, yes=False, prepend="ad_", no_pitc
     # instant cache hit — and only when the alignment actually needs it.
     _t = time.monotonic()
     print("  reading video file...\r", end='')
-    video_arr = parse_audio_from_file(video_file, num_channels)
+    video_arr = parse_audio_from_file(video_file, num_channels, audio_stream=audio_stream)
     print(f"  read video ({time.monotonic() - _t:.1f}s)          ")
 
     _t = time.monotonic()
@@ -2301,7 +2331,7 @@ def combine(video, audio, stretch_audio=False, yes=False, prepend="ad_", no_pitc
         try:
           write_passthrough_media_to_disk(tmp_output_filename, video_file, audio_desc_file,
                                            video_offset=passthrough_offset,
-                                           ad_language=ad_language)
+                                           ad_language=ad_language, audio_stream=audio_stream)
           _atomic_finalize()
         except Exception:
           _cleanup_tmp()
@@ -2316,7 +2346,8 @@ def combine(video, audio, stretch_audio=False, yes=False, prepend="ad_", no_pitc
       scratch_paths = []
       try:
         video_arr, scratch_path = _writable_scratch_copy(
-            parse_audio_from_file(video_file, num_channels), out_dir_for_tmp, 'video')
+            parse_audio_from_file(video_file, num_channels, audio_stream=audio_stream),
+            out_dir_for_tmp, 'video')
         scratch_paths.append(scratch_path)
         # honor_pts must match the feature-pass decode above so this re-parse
         # is the intended cache hit (same key) and stretches the same samples.
@@ -2418,7 +2449,8 @@ def combine(video, audio, stretch_audio=False, yes=False, prepend="ad_", no_pitc
           print("  processing output file...                   \r", end='')
           try:
             write_replaced_media_to_disk(tmp_output_filename, video_arr, None if has_audio_extension else video_file,
-                                         median_slope=median_slope, ad_language=ad_language)
+                                         median_slope=median_slope, ad_language=ad_language,
+                                         audio_stream=audio_stream)
             _atomic_finalize()
           except Exception:
             _cleanup_tmp()
@@ -2443,7 +2475,8 @@ def combine(video, audio, stretch_audio=False, yes=False, prepend="ad_", no_pitc
         try:
           write_replaced_media_to_disk(tmp_output_filename, None, video_file, audio_desc_file,
                                        setts_cmd, video_offset, after_start_key_frame,
-                                       median_slope=median_slope, ad_language=ad_language)
+                                       median_slope=median_slope, ad_language=ad_language,
+                                       audio_stream=audio_stream)
           _atomic_finalize()
         except Exception:
           _cleanup_tmp()
@@ -3104,6 +3137,10 @@ def command_line_interface():
                       help='ISO 639-2 language of the audio description track, e.g. eng. ' + \
                            'Default is the language of the video\'s first audio track, ' + \
                            'when it has one.')
+  parser.add_argument('--audio_stream', type=audio_stream_index, default=0, metavar='N',
+                      help='Which of the video\'s audio streams to align against and fill ' + \
+                           'the description\'s gaps from, counting from 0. Default 0, the ' + \
+                           'first. A release whose first track is a dub needs the original\'s.')
   parser.add_argument('--watch', action='store_true',
                       help='Watch input directories for new file pairs and process them automatically.')
   parser.add_argument('--watch-interval', type=int, default=30, metavar='SECONDS',
@@ -3147,7 +3184,7 @@ def command_line_interface():
         try:
           combine(args.video, args.audio, args.stretch_audio, True, args.prepend,
                   args.no_pitch_correction, args.output_dir, args.alignment_dir, args.dry_run,
-                  ad_language=args.ad_language)
+                  ad_language=args.ad_language, audio_stream=args.audio_stream)
         except KeyboardInterrupt:
           print("\nWatch mode stopped.")
           break
@@ -3158,7 +3195,7 @@ def command_line_interface():
     else:
       combine(args.video, args.audio, args.stretch_audio, args.yes, args.prepend,
               args.no_pitch_correction, args.output_dir, args.alignment_dir, args.dry_run,
-              ad_language=args.ad_language)
+              ad_language=args.ad_language, audio_stream=args.audio_stream)
   else:
     parser.print_usage()
 
