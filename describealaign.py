@@ -1694,6 +1694,157 @@ def confirmed_match_bonuses(confirmed_x, start, length, bonus=None):
   bonuses[idx] = bonus
   return bonuses
 
+# Points per slice when the pass-2 DP turns its candidate arrays back into
+# Python scalars; keeps those temporary lists to a few MB.
+_PASS2_DP_BLOCK_POINTS = 1 << 14
+
+def _pass2_candidates(xs, ys, cluster_ids, quals, bonuses):
+  """
+  Flatten pass 2's per-line candidate points into arrays in DP order.
+
+  Each argument is a list with one array per line cluster, in cluster order:
+  audio indices (int), video positions (float), the cluster's index, match
+  quality and confirmed-match bonus. The lists are consumed (cleared) so each
+  column's per-cluster blocks are freed as soon as it has been flattened.
+
+  Keeps the first point per (audio index, int(video position)) in cluster
+  order -- what the old seen_points set did -- and returns
+  ``(i, j, cluster, qual, bonus)`` ordered by (i, j), the order the old code
+  walked its per-index lists in after sorting them.
+
+  These used to be Python tuples in one list per audio index, plus a set of
+  every key: several hundred bytes a point. A fragmented alignment (a donor
+  with act-level time compression) gives hundreds of clusters, each padded
+  by extend_radius on both sides, so millions of points and 4-7 GB on a
+  45-minute episode. The arrays cost 40 bytes a point, and the DP's
+  backpointers another 40.
+  """
+  # dtype is enforced, not just used for the empty case: np.arange gives
+  # int32 indices on Windows under numpy 1.x, and the composite key below
+  # would overflow int32.
+  def flatten(blocks, dtype):
+    out = np.concatenate(blocks, dtype=dtype) if blocks else np.zeros(0, dtype=dtype)
+    blocks.clear()
+    return out
+
+  i = flatten(xs, np.int64)
+  j = flatten(ys, np.float64)
+  cluster = flatten(cluster_ids, np.int64)
+  if not np.all(np.isfinite(j)):
+    raise RuntimeError("Non-finite video position in pass 2 candidates.")
+  if len(i) == 0:
+    return i, j, cluster, flatten(quals, np.float64), flatten(bonuses, np.float64)
+
+  # int() truncates toward zero, and so does astype(int64). One composite key
+  # per (i, int(j)); np.unique's return_index gives each key's first
+  # occurrence, i.e. the earliest cluster, and the keys come back sorted.
+  j_int = j.astype(np.int64)
+  j_base = int(j_int.min())
+  span = int(j_int.max()) - j_base + 1
+  key = (i - int(i.min())) * span + (j_int - j_base)
+  del j_int
+  _, first = np.unique(key, return_index=True)
+  del key
+  i, j, cluster = i[first], j[first], cluster[first]
+  qual = flatten(quals, np.float64)[first]
+  bonus = flatten(bonuses, np.float64)[first]
+
+  # Sorted by (i, int(j)) with one point per pair, so j strictly increases
+  # within each i: the old per-index sort never reached its tiebreakers and
+  # this order is exactly the order it produced.
+  same_i = i[1:] == i[:-1]
+  if np.any(same_i & (j[1:] <= j[:-1])):
+    raise RuntimeError("Pass 2 candidates are not strictly ordered.")
+  return i, j, cluster, qual, bonus
+
+def _find_pass2_point(cand_i, cand_j, i, j):
+  """Index of the candidate at (i, j), or -1: the old backpointers-dict lookup."""
+  # prev_cache hands i back as a float. Searching the int array with a float
+  # makes numpy cast the whole array on every call, so search with the int;
+  # a key that isn't a whole number can't match, as it couldn't in the dict.
+  if not float(i).is_integer():
+    return -1
+  i = int(i)
+  lo = int(np.searchsorted(cand_i, i, side='left'))
+  hi = int(np.searchsorted(cand_i, i, side='right'))
+  if lo == hi:
+    return -1
+  k = lo + int(np.searchsorted(cand_j[lo:hi], j, side='left'))
+  if k < hi and cand_j[k] == j:
+    return k
+  return -1
+
+def _pass2_path(cand_i, cand_j, cand_cluster, cand_qual, cand_bonus,
+                num_clusters, num_audio, num_video):
+  """
+  Pass 2's monotonic path search over the candidates from _pass2_candidates.
+
+  The loop body is the original one. Its backpointers dict, keyed by (j, i),
+  is now a (points, 5) array indexed by candidate position, and the path walk
+  finds each predecessor by binary search instead of a dict lookup. Returns
+  the same array the dict version built.
+  """
+  best_so_far = SortedList(key=lambda x:x[0])
+  best_so_far.add((0, 0, -1, 0, 0))  # video_index, audio_desc_index, cluster_index, qual, cum_qual
+  clusters_best_so_far = [(0, 0, 0, -1000) for cluster in range(num_clusters)]
+  num_points = len(cand_i)
+  backpointers = np.empty((num_points, 5))
+  prev_cache = np.full((num_video, 5), -np.inf)
+  prev_cache[0] = (0, 0, -1, 0, 0)  # video_index, audio_desc_index, cluster_index, qual, cum_qual
+  # Smallest j at each audio index (the first of its run, since candidates
+  # are ordered by (i, j)), then the minimum over every later index.
+  min_points = np.full(num_audio, np.inf)
+  if num_points:
+    run_starts = np.flatnonzero(np.concatenate(([True], cand_i[1:] != cand_i[:-1])))
+    min_points[cand_i[run_starts]] = cand_j[run_starts]
+  forward_min = np.minimum.accumulate(min_points[::-1])[::-1].tolist()
+  del min_points
+  for start in range(0, num_points, _PASS2_DP_BLOCK_POINTS):
+    stop = min(start + _PASS2_DP_BLOCK_POINTS, num_points)
+    block = zip(range(start, stop), cand_i[start:stop].tolist(), cand_j[start:stop].tolist(),
+                cand_cluster[start:stop].tolist(), cand_qual[start:stop].tolist(),
+                cand_bonus[start:stop].tolist())
+    for point_index, i, j, cluster_index, qual, bonus in block:
+      cur_index = best_so_far.bisect_right((j,))
+      prev_j, prev_i, prev_cluster_index, prev_qual, best_prev_cum_qual = best_so_far[cur_index-1]
+      cluster_last = clusters_best_so_far[cluster_index]
+      if cluster_last[3] >= best_prev_cum_qual:
+        prev_j, prev_i, prev_qual, best_prev_cum_qual = cluster_last
+        prev_cluster_index = cluster_index
+      for prev_j_temp in range(max(0, int(j) - 2), int(j) + 1):
+        prev_node = prev_cache[prev_j_temp].tolist()
+        if cluster_index != prev_node[2]:
+          prev_node[4] -= 100 + 100 * ((j - prev_node[0]) - (i - prev_node[1])) ** 2
+        if prev_node[1] >= (i - 2) and \
+           prev_node[0] <= j and \
+           prev_node[4] >= best_prev_cum_qual:
+          prev_j, prev_i, prev_cluster_index, prev_qual, best_prev_cum_qual = prev_node
+      # The bonus steers the path (cum_qual) only; the stored per-node qual
+      # stays the raw match quality so similarity_percent is unchanged.
+      cum_qual = best_prev_cum_qual + qual + bonus
+      prev_cache[int(j)] = (j, i, cluster_index, qual, cum_qual)
+      cum_qual_jump = cum_qual - 1000
+      if best_so_far[cur_index-1][4] < cum_qual_jump:
+        while (cur_index < len(best_so_far)) and (best_so_far[cur_index][4] <= cum_qual_jump):
+          del best_so_far[cur_index]
+        best_so_far.add((j, i, cluster_index, qual, cum_qual_jump))
+      if forward_min[i] == j and cur_index > 1:
+        del best_so_far[:cur_index-1]
+      cum_qual_cluster_jump = cum_qual - 50
+      if cluster_last[3] < cum_qual_cluster_jump:
+        clusters_best_so_far[cluster_index] = (j, i, qual, cum_qual_cluster_jump)
+      backpointers[point_index] = (prev_j, prev_i, prev_cluster_index, prev_qual, best_prev_cum_qual)
+
+  path = [best_so_far[-1]]
+  while True:
+    point_index = _find_pass2_point(cand_i, cand_j, path[-1][1], path[-1][0])
+    if point_index < 0:
+      break
+    path.append(tuple(backpointers[point_index].tolist()))
+  path.pop()
+  path.reverse()
+  return np.array(path)
+
 
 def align(video_features, audio_desc_features, video_energy, audio_desc_energy):
   samples_per_node = 210 // TIMESTEPS_PER_SECOND
@@ -2030,8 +2181,7 @@ def align(video_features, audio_desc_features, video_energy, audio_desc_energy):
   
   audio_desc_max_energy = np.max(audio_desc_features_scaled[:,0])
   video_max_energy = np.max(video_features_scaled[:,0])
-  points = [[] for i in range(len(audio_desc_features_scaled))]
-  seen_points = set()
+  cand_xs, cand_ys, cand_cluster_ids, cand_quals, cand_bonuses = [], [], [], [], []
   for cluster_index, (x, offset, slope) in enumerate(line_clusters):
     confirmed_x = np.round(x).astype(int)
     limits = get_x_limits(x, offset, slope, extend_horiz=0)
@@ -2059,62 +2209,16 @@ def align(video_features, audio_desc_features, video_energy, audio_desc_energy):
     quals += np.clip(audio_match[:,0] + 2.5 - audio_desc_max_energy, 0, 1) * .1
     energy_diffs = audio_match[:,0] - video_match[:,0]
     bonuses = confirmed_match_bonuses(confirmed_x, limits[0], len(x))
-    for i, j, qual, bonus in zip(x.tolist(), y.tolist(), quals.tolist(), bonuses.tolist()):
-      point = (i, int(j))
-      if point not in seen_points:
-        seen_points.add(point)
-        points[i].append((j, cluster_index, qual, bonus))
-  del seen_points
+    cand_xs.append(x)
+    cand_ys.append(y)
+    cand_cluster_ids.append(np.full(len(x), cluster_index, dtype=np.int64))
+    cand_quals.append(quals)
+    cand_bonuses.append(bonuses)
   del video_interp
-  points = [sorted(point) for point in points]
-  
-  best_so_far = SortedList(key=lambda x:x[0])
-  best_so_far.add((0, 0, -1, 0, 0))  # video_index, audio_desc_index, cluster_index, qual, cum_qual
-  clusters_best_so_far = [(0, 0, 0, -1000) for cluster in line_clusters]
-  backpointers = {}
-  prev_cache = np.full((len(video_features_scaled), 5), -np.inf)
-  prev_cache[0] = (0, 0, -1, 0, 0)  # video_index, audio_desc_index, cluster_index, qual, cum_qual
-  reversed_min_points = [min(x)[0] if len(x) > 0 else np.inf for x in points[::-1]]
-  forward_min = list(itertools.accumulate(reversed_min_points, min))[::-1]
-  del reversed_min_points
-  for i in range(len(audio_desc_features_scaled)):
-    for j, cluster_index, qual, bonus in points[i]:
-      cur_index = best_so_far.bisect_right((j,))
-      prev_j, prev_i, prev_cluster_index, prev_qual, best_prev_cum_qual = best_so_far[cur_index-1]
-      cluster_last = clusters_best_so_far[cluster_index]
-      if cluster_last[3] >= best_prev_cum_qual:
-        prev_j, prev_i, prev_qual, best_prev_cum_qual = cluster_last
-        prev_cluster_index = cluster_index
-      for prev_j_temp in range(max(0, int(j) - 2), int(j) + 1):
-        prev_node = prev_cache[prev_j_temp].tolist()
-        if cluster_index != prev_node[2]:
-          prev_node[4] -= 100 + 100 * ((j - prev_node[0]) - (i - prev_node[1])) ** 2
-        if prev_node[1] >= (i - 2) and \
-           prev_node[0] <= j and \
-           prev_node[4] >= best_prev_cum_qual:
-          prev_j, prev_i, prev_cluster_index, prev_qual, best_prev_cum_qual = prev_node
-      # The bonus steers the path (cum_qual) only; the stored per-node qual
-      # stays the raw match quality so similarity_percent is unchanged.
-      cum_qual = best_prev_cum_qual + qual + bonus
-      prev_cache[int(j)] = (j, i, cluster_index, qual, cum_qual)
-      cum_qual_jump = cum_qual - 1000
-      if best_so_far[cur_index-1][4] < cum_qual_jump:
-        while (cur_index < len(best_so_far)) and (best_so_far[cur_index][4] <= cum_qual_jump):
-          del best_so_far[cur_index]
-        best_so_far.add((j, i, cluster_index, qual, cum_qual_jump))
-      if forward_min[i] == j and cur_index > 1:
-        del best_so_far[:cur_index-1]
-      cum_qual_cluster_jump = cum_qual - 50
-      if cluster_last[3] < cum_qual_cluster_jump:
-        clusters_best_so_far[cluster_index] = (j, i, qual, cum_qual_cluster_jump)
-      backpointers[(j, i)] = (prev_j, prev_i, prev_cluster_index, prev_qual, best_prev_cum_qual)
-  
-  path = [best_so_far[-1]]
-  while path[-1][:2] in backpointers:
-    path.append(backpointers[path[-1][:2]])
-  path.pop()
-  path.reverse()
-  path = np.array(path)
+  candidates = _pass2_candidates(cand_xs, cand_ys, cand_cluster_ids, cand_quals, cand_bonuses)
+  path = _pass2_path(*candidates, num_clusters=len(line_clusters),
+                     num_audio=len(audio_desc_features_scaled), num_video=len(video_features_scaled))
+  del candidates
   if len(path) < max(min(len(video_energy), len(audio_desc_energy)) / 500., 5 * 210):
     diag = diagnose_alignment_failure(video_energy, audio_desc_energy)
     raise AlignmentMismatchError(
