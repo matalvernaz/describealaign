@@ -98,6 +98,14 @@ When using --stretch_audio, the plot also shows which segments of audio were rep
 
 The original audio is used for segments that would be too noticeably distorted (i.e. more than 10% stretched).
 
+### following a description whose speed changes (pass 3)
+
+Broadcast recordings are often sped up by a few per cent to make room for advertising, and not always evenly: the speed can change partway through an act. The alignment builds its map from straight pieces, so where the speed bends inside a piece the description drifts off the picture and back, by a tenth of a second to a second, for a few seconds or a few tens of seconds at a time.
+
+After the map is built, describealaign measures every quarter second along the stretches it replaces how far from the map the description matches the video best, and bends the map only where strong, consistent measurements say it is off. A map that measures right is left exactly as it was, and the parts of the description that get placed never change: a correction moves where they land, never which ones. `--no_refine` turns this off and gives version 2.2.8's alignment.
+
+The JSON report says what happened: `refinement` (how many stretches were measured and bent, and why any were refused), `sync_check` (on the map that was rendered: the share of measurement points with a strong match, `anchored_pct`; of those, the share within 40 ms of the map, `within_pct`, and over 120 ms off, `over_pct`; and how much of the whole video that confirms within 40 ms, `confirmed_pct`, which is the figure to judge a recording by: points are only measured where the map replaces, so another episode's recording that shares nothing but the opening theme can be anchored at nearly every point and still confirm only the theme's minute), `sync_check_line` (the same on the straight-piece map), `refined_segments` (the map that was rendered) and `passthrough`. `segments` and the figures beside it describe the straight-piece map, as before.
+
 ### dry run
 
 Running with `--dry-run` performs the full alignment and saves the alignment plot, but skips writing the output media file. Useful for quickly checking alignment quality before committing to a slow stretch operation:

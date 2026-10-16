@@ -238,6 +238,34 @@ def is_passthrough_alignment(audio_desc_times, video_times, median_slope,
   return True
 
 
+def _passthrough_decision(audio_desc_times, video_times, median_slope, stretch_audio,
+                          has_audio_extension, refinement=None):
+  """
+  Whether combine() muxes the recording untouched at one constant offset.
+
+  Passthrough plays the whole recording at video_times[0] - audio_desc_times[0],
+  whatever the map's shape, and is_passthrough_alignment() only checks each
+  segment's slope, so on its own it would let a bent map (pass 3) or a map that
+  drifts within that slope tolerance be rendered as a straight line. When pass 3
+  ran, passthrough also needs nothing bent and the constant-offset map measured
+  no worse than the map itself (refinement["passthrough_ok"], set by align()).
+  With pass 3 off, or with nothing it could measure, the decision is 2.2.8's.
+  """
+  if not stretch_audio or has_audio_extension:
+    return False
+  if not is_passthrough_alignment(audio_desc_times, video_times, median_slope):
+    return False
+  if not refinement or not refinement.get("applied"):
+    return True
+  if refinement.get("bent", 0):
+    return False
+  if refinement.get("chains", 0) == 0:
+    # pass 3 measured nothing (every replaced stretch under ~4 s): it has no
+    # evidence either way, so the decision is 2.2.8's
+    return True
+  return refinement.get("passthrough_ok") is True
+
+
 import time
 import argparse
 from contextlib import redirect_stderr, redirect_stdout
@@ -798,8 +826,45 @@ def _try_render_alignment_plot(plot_filename_no_ext, path, audio_times, video_ti
   plt.clf()
 
 
+def _refinement_summary(refinement):
+  """Lines for the console and the .txt report saying what pass 3 did and how
+  the alignment measured; none when pass 3 did not run."""
+  if not refinement or not refinement.get("applied"):
+    return []
+  lines = [f"Refinement: bent {refinement.get('bent', 0)} of {refinement.get('stretches', 0)} stretches "
+           f"over {refinement.get('bent_seconds', 0.):.0f} s of the recording, largest correction "
+           f"{refinement.get('max_correction_ms', 0.):.0f} ms"]
+  for label, key in (("Sync check", "sync_check"), ("Sync check, pass 2's map", "sync_check_line")):
+    check = refinement.get(key)
+    if check:
+      confirmed = (f"; {check['confirmed_pct']:.1f}% of the video confirmed within {SYNC_WITHIN_MS:.0f} ms"
+                   if "confirmed_pct" in check else "")
+      lines.append(f"{label}: {check['anchored_pct']:.1f}% of {check['points']} points anchored; "
+                   f"{check['within_pct']:.1f}% within {SYNC_WITHIN_MS:.0f} ms, "
+                   f"{check['over_pct']:.2f}% over {SYNC_FAR_OFF_MS:.0f} ms{confirmed}")
+  return lines
+
+
+def _refinement_record(refinement):
+  """Pass 3's counts for the JSON report: {"applied": false} when it did not run."""
+  if not refinement or not refinement.get("applied"):
+    return {"applied": False}
+  return {key: refinement.get(key) for key in
+          ("applied", "chains", "stretches", "bent", "refused", "bent_seconds", "max_correction_ms")}
+
+
+def _sync_check_record(refinement, passthrough):
+  """The sync check of the map actually output: the constant-offset map when the
+  recording was muxed by passthrough, else the map rendered; None without pass 3."""
+  if not refinement or not refinement.get("applied"):
+    return None
+  if passthrough and refinement.get("sync_check_passthrough"):
+    return refinement["sync_check_passthrough"]
+  return refinement.get("sync_check")
+
+
 def _write_alignment_reports(plot_filename_no_ext, report_data, similarity_percent,
-                             stretch_audio, no_pitch_correction):
+                             stretch_audio, no_pitch_correction, refinement=None, passthrough=False):
   """
   Write the .txt and .json reports describarr (and any other downstream tool)
   consumes. Both files render from the same in-memory structure so consumers
@@ -823,6 +888,8 @@ def _write_alignment_reports(plot_filename_no_ext, report_data, similarity_perce
     print("Main changes needed to video to align it to audio input:", file=file)
     print(f"Start Offset: {-video_offset:.2f} seconds", file=file)
     print(f"Median Rate Change: {median_rate_pct:.2f}%", file=file)
+    for line in _refinement_summary(refinement):
+      print(line, file=file)
     for seg in segment_records:
       print(f"Rate change of {seg['rate_pct']:8.1f}% from {_format_hms(seg['video_start_sec'])} to "
             f"{_format_hms(seg['video_end_sec'])} aligning with audio from "
@@ -838,6 +905,11 @@ def _write_alignment_reports(plot_filename_no_ext, report_data, similarity_perce
     "median_rate_pct": float(median_rate_pct),
     "start_offset_sec": float(-video_offset),
     "segments": segment_records,
+    "refined_segments": report_data.get("refined_segment_records", segment_records),
+    "refinement": _refinement_record(refinement),
+    "sync_check": _sync_check_record(refinement, passthrough),
+    "sync_check_line": (refinement or {}).get("sync_check_line"),
+    "passthrough": bool(passthrough),
   }
   import json as _json
   with open(plot_filename_no_ext + '.json', 'w') as file:
@@ -873,17 +945,87 @@ def _write_failure_sidecar(alignment_dir, video_file, diagnostic):
 
 
 def plot_alignment(plot_filename_no_ext, path, audio_times, video_times, similarity_percent,
-                   median_slope, stretch_audio, no_pitch_correction):
+                   median_slope, stretch_audio, no_pitch_correction, refinement=None,
+                   passthrough=False):
   """
   Write the alignment PNG (best-effort, requires matplotlib) and the .txt +
   .json reports (always). The reports are what describarr and other
   downstream tooling consume; the PNG is for human-eyeball debugging.
+
+  audio_times/video_times are the map rendered. The reports' "segments" and
+  the figures computed from them stay pass 2's line map, as before pass 3
+  existed; the rendered map is "refined_segments".
   """
-  report_data = _compute_report_data(audio_times, video_times, median_slope)
+  refinement = refinement or {}
+  line_audio = refinement.get("line_audio_times", audio_times)
+  line_video = refinement.get("line_video_times", video_times)
+  report_data = _compute_report_data(line_audio, line_video, median_slope)
+  report_data["refined_segment_records"] = _compute_report_data(audio_times, video_times, median_slope)["segment_records"]
   _try_render_alignment_plot(plot_filename_no_ext, path, audio_times, video_times,
                              similarity_percent, stretch_audio)
   _write_alignment_reports(plot_filename_no_ext, report_data, similarity_percent,
-                           stretch_audio, no_pitch_correction)
+                           stretch_audio, no_pitch_correction, refinement=refinement,
+                           passthrough=passthrough)
+
+def _replace_mask(audio_desc_times, video_times):
+  """
+  Which segments of a map replace_aligned_segments() fills with the recording:
+  at least MIN_DURATION_TO_REPLACE_SECONDS of video at a rate within
+  MAX_RATE_RATIO_DIFF_ALIGN, both measured in whole samples, plus any shorter
+  segment sitting between two replaced ones (filled in order, so two short
+  segments in a row stay unreplaced). The renderer and pass 3 both use this one
+  function, so the refinement can never disagree with what is rendered.
+  """
+  x_samples = (np.asarray(audio_desc_times) * AUDIO_SAMPLE_RATE).astype(int)
+  y_samples = (np.asarray(video_times) * AUDIO_SAMPLE_RATE).astype(int)
+  diff_x_samples = np.diff(x_samples)
+  diff_y_samples = np.diff(y_samples)
+  with np.errstate(divide='ignore', invalid='ignore'):
+    slopes = diff_x_samples / diff_y_samples
+  num_segments = len(x_samples) - 1
+  replace_mask = np.array([
+    (diff_y_samples[i] >= MIN_DURATION_TO_REPLACE_SECONDS * AUDIO_SAMPLE_RATE
+     and np.abs(1 - slopes[i]) <= MAX_RATE_RATIO_DIFF_ALIGN)
+    for i in range(num_segments)
+  ], dtype=bool)
+  # Fill short skipped segments that sit fully inside a continuous run of
+  # replaced segments. Without this, alignment-slope jitter in the middle
+  # of continuous narration can fragment a single AD region into multiple
+  # sub-segments where any sub-segment shorter than
+  # MIN_DURATION_TO_REPLACE_SECONDS is dropped — punching audible holes
+  # of original program audio through active narration. The slope gate
+  # still blocks fundamentally-bad alignments (>10 % rate change), so we
+  # only fill segments that are short by *duration*.
+  for i in range(1, num_segments - 1):
+    if replace_mask[i]:
+      continue
+    if not (replace_mask[i - 1] and replace_mask[i + 1]):
+      continue
+    if diff_y_samples[i] >= MIN_DURATION_TO_REPLACE_SECONDS * AUDIO_SAMPLE_RATE:
+      continue
+    if np.abs(1 - slopes[i]) > MAX_RATE_RATIO_DIFF_ALIGN:
+      continue
+    replace_mask[i] = True
+  return replace_mask
+
+
+def _replaced_recording_samples(audio_desc_times, video_times):
+  """
+  The recording's samples the renderer places, as merged [start, end) runs.
+  Pass 3 must leave these exactly as they were: it may move where a sample
+  lands in the video, never which samples are used.
+  """
+  replace_mask = _replace_mask(audio_desc_times, video_times)
+  x_samples = (np.asarray(audio_desc_times) * AUDIO_SAMPLE_RATE).astype(int)
+  runs = []
+  for i in np.flatnonzero(replace_mask):
+    start, end = int(x_samples[i]), int(x_samples[i + 1])
+    if runs and start <= runs[-1][1]:
+      runs[-1][1] = max(runs[-1][1], end)
+    else:
+      runs.append([start, end])
+  return runs
+
 
 # use the smooth alignment to replace runs of video sound with corresponding described audio
 def replace_aligned_segments(video_arr, audio_desc_arr, audio_desc_times, video_times, no_pitch_correction,
@@ -1093,29 +1235,7 @@ def replace_aligned_segments(video_arr, audio_desc_arr, audio_desc_times, video_
   last_progress_update = -1
   _stretch_start = time.monotonic()
   num_segments = len(x) - 1
-  replace_mask = np.array([
-    (diff_y_samples[i] >= MIN_DURATION_TO_REPLACE_SECONDS * AUDIO_SAMPLE_RATE
-     and np.abs(1 - slopes[i]) <= MAX_RATE_RATIO_DIFF_ALIGN)
-    for i in range(num_segments)
-  ])
-  # Fill short skipped segments that sit fully inside a continuous run of
-  # replaced segments. Without this, alignment-slope jitter in the middle
-  # of continuous narration can fragment a single AD region into multiple
-  # sub-segments where any sub-segment shorter than
-  # MIN_DURATION_TO_REPLACE_SECONDS is dropped — punching audible holes
-  # of original program audio through active narration. The slope gate
-  # still blocks fundamentally-bad alignments (>10 % rate change), so we
-  # only fill segments that are short by *duration*.
-  for i in range(1, num_segments - 1):
-    if replace_mask[i]:
-      continue
-    if not (replace_mask[i - 1] and replace_mask[i + 1]):
-      continue
-    if diff_y_samples[i] >= MIN_DURATION_TO_REPLACE_SECONDS * AUDIO_SAMPLE_RATE:
-      continue
-    if np.abs(1 - slopes[i]) > MAX_RATE_RATIO_DIFF_ALIGN:
-      continue
-    replace_mask[i] = True
+  replace_mask = _replace_mask(audio_desc_times, video_times)
 
   # Snapshot the original video audio at every AD-region boundary BEFORE the
   # main loop overwrites it, so we can equal-power crossfade the seam later.
@@ -1846,7 +1966,623 @@ def _pass2_path(cand_i, cand_j, cand_cluster, cand_qual, cand_bonus,
   return np.array(path)
 
 
-def align(video_features, audio_desc_features, video_energy, audio_desc_energy):
+# Pass 3: follow a recording whose speed bends inside pass 2's straight lines.
+#
+# Pass 2 pieces the map together from straight line clusters. A broadcast whose
+# time compression changes within an act bends between those lines, and the map
+# is off by up to the gap: Law & Order: SVU S01E07 (2026-10-16), measured by
+# speech, was 0.38 s late at 17:22, inside a 33 s piece at 5.24 %, and in sync
+# on either side. Pass 3 measures, every quarter second along the stretches the
+# renderer replaces, how far from the map the recording's features match the
+# video best, and bends the map only where strong, consistent measurements say
+# it is off. A map that measures right is left exactly as pass 2 made it.
+# Frames here are pass 2's, 210 a second.
+REFINE_FRAMES_PER_SECOND = 210
+REFINE_GRID_FRAMES = 52               # a measurement every ~0.25 s of the recording
+REFINE_HALF_WINDOW_FRAMES = 105       # each sums pass 2's qual over +-0.5 s
+REFINE_MAX_LAG_FRAMES = 314           # searching +-1.5 s around the map
+REFINE_LAG_STEP_FRAMES = 2            # lags every 2 frames; a parabola finds the peak between them
+REFINE_SUM_STEP_FRAMES = 2            # quals summed on every second frame, scaled to a full sum
+REFINE_LAG_CHANGE_COST = 2.0          # path: per frame the lag moves between measurements
+REFINE_LAG_COST = 0.25                # path: per frame of lag per measurement (toward the map)
+REFINE_RIVAL_FRAMES = 10              # a rival peak is at least this far from the best
+REFINE_ANCHOR_MARGIN = 80.0           # an anchor's best lag beats every rival by this much
+REFINE_AGREE_FRAMES = 3               # and agrees this closely with the path
+REFINE_ACTIVATE_FRAMES = 6.0          # ~29 ms: smaller corrections are left alone
+# anchors a stretch needs, by its largest correction in frames: ~100 ms, ~300 ms, more
+REFINE_EVIDENCE = ((21.0, 4), (63.0, 8), (float('inf'), 16))
+REFINE_SETTLE_FRAMES = 1.0            # a stretch extends outward until the correction is this small
+REFINE_MAX_EXTEND_POINTS = 8          # but by 2 s at most each side
+REFINE_MIN_NODE_GAP_SECONDS = 2.1     # added nodes keep this far apart on both axes (the renderer replaces >= 2 s)
+REFINE_TOLERANCE_FRAMES = 1.5         # added nodes follow the correction this closely (~7 ms)
+REFINE_CHAIN_GAP_SECONDS = 2.0        # connectors shorter than this on both axes join runs into one chain
+REFINE_PIN_RATE = 0.04                # a correction eased to 0 at a chain's end adds at most 4 % rate
+REFINE_IMPROVEMENT = 0.8              # a bend must cut its anchors' mean error to 80 % or less
+REFINE_KEEP_EVIDENCE = 0.9            # and keep a usable peak at 90 % of them
+SYNC_WITHIN_MS = 40.0                 # an anchor this close confirms the map
+SYNC_FAR_OFF_MS = 120.0               # an anchor this far off contradicts it
+
+
+def _refine_chains(audio_desc_times, video_times, replace_mask):
+  """
+  (first node, last node) of each chain: a run of replaced segments, joined to
+  the next run across a connector shorter than REFINE_CHAIN_GAP_SECONDS on both
+  axes (pass 2's junction between two lines; the renderer's own line between
+  short and long). Inside a chain a connector moves rigidly with the node before
+  it, so joining runs never changes one. A real hole, where one side has
+  seconds the other lacks, ends a chain.
+  """
+  runs = []
+  start = None
+  for segment, replaced in enumerate(list(replace_mask) + [False]):
+    if replaced and start is None:
+      start = segment
+    elif not replaced and start is not None:
+      runs.append([start, segment])
+      start = None
+  chains = []
+  for first, last in runs:
+    if chains:
+      audio_gap = audio_desc_times[first] - audio_desc_times[chains[-1][1]]
+      video_gap = video_times[first] - video_times[chains[-1][1]]
+      if audio_gap < REFINE_CHAIN_GAP_SECONDS and video_gap < REFINE_CHAIN_GAP_SECONDS:
+        chains[-1][1] = last
+        continue
+    chains.append([first, last])
+  return chains
+
+
+def _refine_interpolable(audio_frames, video_frames):
+  """The nodes that increase on both axes, for interpolation: pass 2 can leave a
+  pair a few samples backwards where two lines meet."""
+  keep = [0]
+  for node in range(1, len(audio_frames)):
+    if audio_frames[node] > audio_frames[keep[-1]] and video_frames[node] > video_frames[keep[-1]]:
+      keep.append(node)
+  return audio_frames[keep], video_frames[keep]
+
+
+def _refine_scores(audio_features, video_features, map_audio_frames, map_video_frames, grid_frames):
+  """
+  scores[point, lag]: pass 2's qual between the recording and the video, summed
+  over +-REFINE_HALF_WINDOW_FRAMES around each grid point, with the video read
+  at the map's position plus the lag. Returns (scores, lags in frames).
+
+  Lags step by REFINE_LAG_STEP_FRAMES and quals are summed on every
+  REFINE_SUM_STEP_FRAMES-th frame, scaled back to a full sum: the features are
+  smoothed over ~15 frames, so this finds the exhaustive search's peaks for a
+  quarter of the work. Both feature arrays are (frames, 3) float32.
+  """
+  half = REFINE_HALF_WINDOW_FRAMES
+  step = REFINE_SUM_STEP_FRAMES
+  lags = np.arange(-REFINE_MAX_LAG_FRAMES, REFINE_MAX_LAG_FRAMES + 1, REFINE_LAG_STEP_FRAMES)
+  num_video = len(video_features)
+  first_frame = int(max(0, grid_frames[0] - half))
+  end_frame = int(min(len(audio_features), grid_frames[-1] + half + 1))
+  frames = np.arange(first_frame, end_frame, step)
+  mapped = np.interp(frames, map_audio_frames, map_video_frames)
+  audio = audio_features[frames]
+  window_starts = np.searchsorted(frames, grid_frames - half, side='left')
+  window_ends = np.searchsorted(frames, grid_frames + half, side='right')
+  scores = np.empty((len(grid_frames), len(lags)))
+  for lag_index, lag in enumerate(lags):
+    positions = mapped + lag
+    inside = (positions >= 0) & (positions < num_video - 1)
+    lower = np.clip(np.floor(positions).astype(np.int64), 0, num_video - 2)
+    fraction = (positions - lower).astype(np.float32)[:, None]
+    video = video_features[lower] * (1 - fraction) + video_features[lower + 1] * fraction
+    quals = np.sum(-.5 - np.log10(1e-4 + np.abs(audio - video)), axis=1)
+    quals = np.where(inside, quals, -50.)
+    cumulative = np.concatenate(([0.], np.cumsum(quals, dtype=np.float64)))
+    scores[:, lag_index] = (cumulative[window_ends] - cumulative[window_starts]) * step
+  return scores, lags
+
+
+def _refine_path(scores, lags):
+  """
+  One lag per grid point, maximising the summed scores less
+  REFINE_LAG_CHANGE_COST per frame the lag moves between points and
+  REFINE_LAG_COST per frame of lag at each point. The best previous lag under
+  an L1 penalty comes from two running maxima, one from each end, so a step
+  costs O(lags) rather than O(lags squared).
+  """
+  num_points, num_lags = scores.shape
+  index = np.arange(num_lags)
+  change_cost = REFINE_LAG_CHANGE_COST * (lags[1] - lags[0]) if num_lags > 1 else 0.
+  prior = -REFINE_LAG_COST * np.abs(lags)
+  totals = scores[0] + prior
+  back = np.empty((num_points, num_lags), dtype=np.int32)
+  back[0] = index
+  for point in range(1, num_points):
+    rising = totals + change_cost * index
+    best_rising = np.maximum.accumulate(rising)
+    from_below = np.maximum.accumulate(np.where(rising == best_rising, index, 0))
+    falling = (totals - change_cost * index)[::-1]
+    best_falling = np.maximum.accumulate(falling)
+    from_above = (num_lags - 1) - np.maximum.accumulate(np.where(falling == best_falling, index, 0))[::-1]
+    below_value = best_rising - change_cost * index
+    above_value = best_falling[::-1] + change_cost * index
+    use_below = below_value >= above_value
+    back[point] = np.where(use_below, from_below, from_above)
+    totals = scores[point] + prior + np.where(use_below, below_value, above_value)
+  path = np.empty(num_points, dtype=np.int64)
+  path[-1] = int(np.argmax(totals))
+  for point in range(num_points - 1, 0, -1):
+    path[point - 1] = back[point, path[point]]
+  return path
+
+
+def _refine_peaks(scores, lags, path=None):
+  """
+  For each grid point: the best lag in frames (a parabola through its
+  neighbours places it between lag steps), how far its score beats every rival
+  at least REFINE_RIVAL_FRAMES away, and whether it is an anchor: beats them by
+  REFINE_ANCHOR_MARGIN, is not at the edge of the search, and, when a path is
+  given, agrees with it within REFINE_AGREE_FRAMES, so a strong but isolated
+  false peak is not one.
+  """
+  num_points, num_lags = scores.shape
+  rows = np.arange(num_points)
+  best = np.argmax(scores, axis=1)
+  peak = scores[rows, best]
+  rivals = np.abs(lags[None, :] - lags[best][:, None]) > REFINE_RIVAL_FRAMES
+  margin = peak - np.where(rivals, scores, -np.inf).max(axis=1)
+  lag = lags[best].astype(float)
+  inner = (best > 0) & (best < num_lags - 1)
+  left = scores[rows[inner], best[inner] - 1]
+  right = scores[rows[inner], best[inner] + 1]
+  curvature = left - 2 * peak[inner] + right
+  with np.errstate(divide='ignore', invalid='ignore'):
+    shift = np.where(curvature < 0, 0.5 * (left - right) / curvature, 0.)
+  lag[inner] += np.clip(shift, -.5, .5) * REFINE_LAG_STEP_FRAMES
+  at_edge = np.abs(lags[best]) >= REFINE_MAX_LAG_FRAMES - 5
+  anchor = (margin >= REFINE_ANCHOR_MARGIN) & ~at_edge
+  if path is not None:
+    anchor &= np.abs(lags[best] - lags[path]) <= REFINE_AGREE_FRAMES
+  return lag, margin, anchor
+
+
+def _refine_running_median(values, width):
+  half = width // 2
+  return np.array([np.median(values[max(0, i - half):i + half + 1]) for i in range(len(values))])
+
+
+def _refine_correction(lag, anchor):
+  """
+  The correction through the anchors at every grid point (a running median over
+  them, interpolated between), and the [first, last] grid points of each
+  stretch worth bending: where it reaches REFINE_ACTIVATE_FRAMES and enough
+  anchors carry it (REFINE_EVIDENCE: more for a larger correction), extended
+  outward until it settles.
+  """
+  num_points = len(lag)
+  if anchor.sum() < REFINE_EVIDENCE[0][1]:
+    return np.zeros(num_points), []
+  curve = np.interp(np.arange(num_points), np.flatnonzero(anchor), _refine_running_median(lag[anchor], 5))
+  active = np.abs(curve) >= REFINE_ACTIVATE_FRAMES
+  stretches = []
+  point = 0
+  while point < num_points:
+    if not active[point]:
+      point += 1
+      continue
+    start = point
+    while point < num_points and active[point]:
+      point += 1
+    end = point - 1
+    largest = np.max(np.abs(curve[start:end + 1]))
+    needed = next(count for limit, count in REFINE_EVIDENCE if largest <= limit)
+    if anchor[start:end + 1].sum() < needed:
+      continue
+    # extend outward while the correction is still settling
+    low, high = start, end
+    while low > 0 and start - low < REFINE_MAX_EXTEND_POINTS and abs(curve[low - 1]) > REFINE_SETTLE_FRAMES:
+      low -= 1
+    while high < num_points - 1 and high - end < REFINE_MAX_EXTEND_POINTS and abs(curve[high + 1]) > REFINE_SETTLE_FRAMES:
+      high += 1
+    if stretches and low <= stretches[-1][1] + 1:
+      stretches[-1][1] = high
+    else:
+      stretches.append([low, high])
+  return curve, stretches
+
+
+def _refine_stretch_correction(curve, low, high):
+  """The correction for one stretch: the curve from its first grid point to its
+  last, exactly 0 outside. It falls to 0 between the stretch's edge and the next
+  grid point, so a slip that runs right up to a junction is corrected up to it."""
+  correction = np.zeros(len(curve))
+  correction[low:high + 1] = curve[low:high + 1]
+  return correction
+
+
+def _refine_pinned(correction, low, high):
+  """
+  The stretch's correction eased to 0 at the end of the chain it reaches, so
+  the chain's end node, and the hole beyond it, stay where pass 2 put them. The
+  ramp is long enough that the rate it adds stays under REFINE_PIN_RATE.
+  """
+  pinned = correction.copy()
+  last_point = len(correction) - 1
+  per_point = REFINE_PIN_RATE * REFINE_GRID_FRAMES
+  if high == last_point:
+    length = max(REFINE_MAX_EXTEND_POINTS, int(np.ceil(abs(correction[high]) / per_point)))
+    start = max(low, high - length)
+    pinned[start:high + 1] *= np.linspace(1., 0., high - start + 1)
+  if low == 0:
+    length = max(REFINE_MAX_EXTEND_POINTS, int(np.ceil(abs(correction[low]) / per_point)))
+    end = min(high, low + length)
+    pinned[low:end + 1] *= np.linspace(0., 1., end - low + 1)
+  return pinned
+
+
+def _refine_simplify(points, values, tolerance):
+  """Douglas-Peucker: the indices of the points a polyline needs to stay within
+  tolerance of values."""
+  keep = np.zeros(len(points), dtype=bool)
+  keep[0] = keep[-1] = True
+  pending = [(0, len(points) - 1)]
+  while pending:
+    start, end = pending.pop()
+    if end <= start + 1:
+      continue
+    chord = values[start] + (values[end] - values[start]) * (points[start + 1:end] - points[start]) / (points[end] - points[start])
+    error = np.abs(values[start + 1:end] - chord)
+    worst = int(np.argmax(error))
+    if error[worst] > tolerance:
+      middle = start + 1 + worst
+      keep[middle] = True
+      pending.append((start, middle))
+      pending.append((middle, end))
+  return list(np.flatnonzero(keep))
+
+
+def _refine_spacing(audio_points, video_points, keep, min_gap):
+  """Drop interior points, the cheapest first, until every neighbouring pair is
+  at least min_gap apart on both axes."""
+  keep = list(keep)
+  while len(keep) > 2:
+    gaps = np.minimum(np.diff(audio_points[keep]), np.diff(video_points[keep]))
+    if gaps.min() >= min_gap:
+      break
+    shortest = int(np.argmin(gaps))
+    candidates = [index for index in (shortest, shortest + 1) if 0 < index < len(keep) - 1]
+    if not candidates:
+      break
+    def cost(index):
+      start, end = keep[index - 1], keep[index + 1]
+      span = audio_points[start:end + 1]
+      chord = video_points[start] + (video_points[end] - video_points[start]) * (span - audio_points[start]) / (audio_points[end] - audio_points[start])
+      return np.max(np.abs(video_points[start:end + 1] - chord))
+    del keep[min(candidates, key=cost)]
+  return keep
+
+
+def _refine_long_segments(video_times, replace_mask):
+  """Replaced segments the renderer replaces on their own length (not short ones it fills)."""
+  return np.asarray(replace_mask, dtype=bool) & (np.diff(video_times) >= MIN_DURATION_TO_REPLACE_SECONDS)
+
+
+def _refine_junctions(audio_desc_times, video_times, replace_mask, first, last, start_seconds, end_seconds):
+  """The end nodes of the short segments (junctions between two of pass 2's lines,
+  short ones the renderer fills) inside a chain that overlap a stretch."""
+  long_segment = _refine_long_segments(video_times, replace_mask)
+  return {node + 1 for node in range(first, last)
+          if not long_segment[node]
+          and audio_desc_times[node + 1] >= start_seconds and audio_desc_times[node] <= end_seconds}
+
+
+def _refine_bend(audio_desc_times, video_times, replace_mask, first, last, grid_seconds, correction_seconds,
+                 rigid=frozenset()):
+  """
+  The chain's nodes first..last, moved along the video axis by the correction
+  at their place in the recording (exactly 0 outside the stretch, so those nodes
+  keep their values bit for bit), with nodes added inside long replaced segments
+  where the correction curves. A node listed in rigid ends a short segment that
+  must keep its shape: it moves with the node before it, so that segment's
+  length and rate on both axes stay as they were. A node never moves along the
+  recording axis. Returns (audio, video, added).
+  """
+  def correction_at(seconds):
+    return np.interp(seconds, grid_seconds, correction_seconds,
+                     left=correction_seconds[0], right=correction_seconds[-1])
+  long_segment = _refine_long_segments(video_times, replace_mask)
+  audio, video, added = [], [], []
+  correction = 0.
+  for node in range(first, last + 1):
+    if node == first or node not in rigid:
+      correction = correction_at(audio_desc_times[node])
+    audio.append(audio_desc_times[node])
+    video.append(video_times[node] + correction)
+    added.append(False)
+    if node == last or not long_segment[node]:
+      continue
+    start, end = audio_desc_times[node], audio_desc_times[node + 1]
+    if end - start < 2 * REFINE_MIN_NODE_GAP_SECONDS:
+      continue
+    inner = grid_seconds[(grid_seconds > start) & (grid_seconds < end)]
+    if len(inner) == 0 or not np.any(correction_at(inner) != 0):
+      continue
+    points = np.concatenate(([start], inner, [end]))
+    corrections = correction_at(points)
+    corrections[0] = correction
+    slope = (video_times[node + 1] - video_times[node]) / (end - start)
+    bent = video_times[node] + slope * (points - start) + corrections
+    keep = _refine_simplify(points, corrections, REFINE_TOLERANCE_FRAMES / REFINE_FRAMES_PER_SECOND)
+    keep = _refine_spacing(points, bent, keep, REFINE_MIN_NODE_GAP_SECONDS)
+    for index in keep[1:-1]:
+      audio.append(float(points[index]))
+      video.append(float(bent[index]))
+      added.append(True)
+  return np.array(audio), np.array(video), np.array(added, dtype=bool)
+
+
+def _refine_splice(audio_desc_times, video_times, first, last, chain_audio, chain_video):
+  """The whole map with nodes first..last replaced by the chain's new nodes."""
+  audio = np.concatenate((audio_desc_times[:first], chain_audio, audio_desc_times[last + 1:]))
+  video = np.concatenate((video_times[:first], chain_video, video_times[last + 1:]))
+  return audio, video
+
+
+def _refine_refusal(audio_desc_times, video_times, first, last, chain_audio, chain_video, added):
+  """
+  Why a bend may not be kept, or None. Node order: every neighbouring pair of
+  pass-2 nodes that increased on both axes still does (a pair pass 2 left
+  backwards stays as it was), and every added node sits strictly between its
+  neighbours. Coverage: the recording samples the renderer places are exactly
+  the same runs, to the sample.
+  """
+  original = np.flatnonzero(~added)
+  old_audio = audio_desc_times[first:last + 1]
+  old_video = video_times[first:last + 1]
+  increased = (np.diff(old_audio) > 0) & (np.diff(old_video) > 0)
+  still = (np.diff(chain_audio[original]) > 0) & (np.diff(chain_video[original]) > 0)
+  if np.any(increased & ~still):
+    return "node order"
+  touches_added = added[1:] | added[:-1]
+  if np.any(touches_added & ((np.diff(chain_audio) <= 0) | (np.diff(chain_video) <= 0))):
+    return "node order"
+  if first > 0 and audio_desc_times[first - 1] < old_audio[0] and video_times[first - 1] < old_video[0] \
+     and not video_times[first - 1] < chain_video[0]:
+    return "node order"
+  if last + 1 < len(video_times) and old_audio[-1] < audio_desc_times[last + 1] \
+     and old_video[-1] < video_times[last + 1] and not chain_video[-1] < video_times[last + 1]:
+    return "node order"
+  new_audio, new_video = _refine_splice(audio_desc_times, video_times, first, last, chain_audio, chain_video)
+  if _replaced_recording_samples(new_audio, new_video) != _replaced_recording_samples(audio_desc_times, video_times):
+    return "replaced samples"
+  return None
+
+
+def _refine_verdict(before_lag, after_lag, after_margin):
+  """
+  Whether a bend measured better, judged at the anchors it was built from (not
+  at whichever points measure well afterwards, which could hide points the bend
+  made worse): a usable peak must remain at REFINE_KEEP_EVIDENCE of them, their
+  mean error must fall to REFINE_IMPROVEMENT of what it was, and none of them
+  that was within SYNC_FAR_OFF_MS may end up past it (anchor by anchor, so
+  fixing one bad anchor cannot pay for spoiling a good one). Returns the
+  refusal reason, or None.
+  """
+  if len(before_lag) == 0:
+    return "no anchors"
+  usable = after_margin >= REFINE_ANCHOR_MARGIN / 2
+  if np.mean(usable) < REFINE_KEEP_EVIDENCE:
+    return "lost evidence"
+  if np.mean(np.abs(after_lag)) > REFINE_IMPROVEMENT * np.mean(np.abs(before_lag)):
+    return "measured no better"
+  far_frames = SYNC_FAR_OFF_MS / 1000. * REFINE_FRAMES_PER_SECOND
+  if np.any((np.abs(after_lag) > far_frames) & (np.abs(before_lag) <= far_frames)):
+    return "measured no better"
+  return None
+
+
+def _refine_passthrough_verdict(line_lag, offset_lag, offset_margin):
+  """
+  Whether the constant offset passthrough would mux measures as well as the
+  map, at the map's own anchors: a usable peak must remain at
+  REFINE_KEEP_EVIDENCE of them (a weak peak that happens to sit near zero
+  supports nothing), no fewer may be within SYNC_WITHIN_MS, and none within
+  SYNC_FAR_OFF_MS may end up past it. Returns (ok, tally), the tally counting
+  only the positions whose peak stayed usable.
+  """
+  usable = offset_margin >= REFINE_ANCHOR_MARGIN / 2
+  tally = _sync_tally(offset_lag, usable)
+  if len(line_lag) == 0 or np.mean(usable) < REFINE_KEEP_EVIDENCE:
+    return False, tally
+  within_frames = SYNC_WITHIN_MS / 1000. * REFINE_FRAMES_PER_SECOND
+  far_frames = SYNC_FAR_OFF_MS / 1000. * REFINE_FRAMES_PER_SECOND
+  if tally["within_40ms"] < int(np.sum(np.abs(line_lag) <= within_frames)):
+    return False, tally
+  if np.any(usable & (np.abs(offset_lag) > far_frames) & (np.abs(line_lag) <= far_frames)):
+    return False, tally
+  return True, tally
+
+
+def _sync_tally(lag, anchor):
+  error_ms = np.abs(lag[anchor]) / REFINE_FRAMES_PER_SECOND * 1000.
+  return {"points": int(len(lag)), "anchors": int(np.sum(anchor)),
+          "within_40ms": int(np.sum(error_ms <= SYNC_WITHIN_MS)),
+          "over_120ms": int(np.sum(error_ms > SYNC_FAR_OFF_MS))}
+
+
+def _sync_add(total, part):
+  for key, value in part.items():
+    total[key] = total.get(key, 0) + value
+  return total
+
+
+def sync_check_percentages(tally, video_seconds=None):
+  """
+  The share of points anchored, of anchors within 40 ms and over 120 ms, and
+  how much of the whole video is confirmed: anchors within 40 ms, a grid step of
+  the recording each, against the video's length. Points are only measured
+  where the map replaces, so a recording that matches nothing but the opening
+  theme another episode shares is anchored at nearly every point it has and
+  confirms only the theme's minute of the video (Phineas and Ferb S02E27 against
+  "The Beak", 2026-10-16: 99 % anchored, 8 % of the video confirmed).
+  """
+  points = tally.get("points", 0)
+  anchors = tally.get("anchors", 0)
+  confirmed_seconds = tally.get("within_40ms", 0) * REFINE_GRID_FRAMES / REFINE_FRAMES_PER_SECOND
+  result = {**tally,
+            "anchored_pct": 100. * anchors / points if points else 0.,
+            "within_pct": 100. * tally.get("within_40ms", 0) / anchors if anchors else 0.,
+            "over_pct": 100. * tally.get("over_120ms", 0) / anchors if anchors else 0.,
+            "confirmed_seconds": confirmed_seconds}
+  if video_seconds:
+    result["video_seconds"] = float(video_seconds)
+    result["confirmed_pct"] = min(100., 100. * confirmed_seconds / video_seconds)
+  return result
+
+
+def refine_alignment(audio_desc_times, video_times, audio_desc_features, video_features, median_slope=None):
+  """
+  Pass 3. Returns (audio_desc_times, video_times, report): the map, bent where
+  the recording measures off it and otherwise exactly as given, and a report:
+  how many chains and stretches were measured and bent, why any were refused,
+  "sync_check" measured on the map returned, "sync_check_line" on the map as
+  given, and, when nothing was bent and the map would be muxed at a constant
+  offset, whether that constant-offset map measures as well ("passthrough_ok",
+  with "sync_check_passthrough").
+  """
+  audio_desc_times = np.asarray(audio_desc_times, dtype=float)
+  video_times = np.asarray(video_times, dtype=float)
+  audio_features = np.ascontiguousarray(audio_desc_features, dtype=np.float32)
+  video_features = np.ascontiguousarray(video_features, dtype=np.float32)
+  fps = REFINE_FRAMES_PER_SECOND
+  report = {"applied": True, "chains": 0, "stretches": 0, "bent": 0, "refused": {},
+            "bent_seconds": 0., "max_correction_ms": 0.,
+            "line_audio_times": audio_desc_times.copy(), "line_video_times": video_times.copy()}
+  replace_mask = _replace_mask(audio_desc_times, video_times)
+  map_audio, map_video = _refine_interpolable(audio_desc_times * fps, video_times * fps)
+  line_tally, final_tally = {}, {}
+  measured = []                 # per chain: (first, last, grid frames, best lags, anchors) on the given map
+  bent_chains = []              # (first, last, chain audio, chain video)
+  for first, last in _refine_chains(audio_desc_times, video_times, replace_mask):
+    grid = np.arange(np.ceil(audio_desc_times[first] * fps + REFINE_HALF_WINDOW_FRAMES),
+                     np.floor(audio_desc_times[last] * fps - REFINE_HALF_WINDOW_FRAMES) + 1,
+                     REFINE_GRID_FRAMES).astype(np.int64)
+    if len(grid) < 2 * REFINE_EVIDENCE[0][1]:
+      continue
+    report["chains"] += 1
+    scores, lags = _refine_scores(audio_features, video_features, map_audio, map_video, grid)
+    lag, margin, anchor = _refine_peaks(scores, lags, _refine_path(scores, lags))
+    measured.append((first, last, grid, lag, anchor))
+    tally = _sync_tally(lag, anchor)
+    _sync_add(line_tally, tally)
+    curve, stretches = _refine_correction(lag, anchor)
+    grid_seconds = grid / fps
+    total = np.zeros(len(grid))
+    rigid = frozenset()
+    for low, high in stretches:
+      report["stretches"] += 1
+      correction = _refine_stretch_correction(curve, low, high)
+      # Bend freely first. If that would change what the renderer replaces, keep
+      # the junctions inside the stretch rigid; and at a chain's end, ease the
+      # correction to 0 so the hole beyond keeps its shape too.
+      junctions = _refine_junctions(audio_desc_times, video_times, replace_mask, first, last,
+                                    grid_seconds[low], grid_seconds[high])
+      attempts = [(correction, rigid), (correction, rigid | junctions)]
+      if low == 0 or high == len(grid) - 1:
+        attempts.append((_refine_pinned(correction, low, high), rigid | junctions))
+      for attempt, attempt_rigid in attempts:
+        trial = total + attempt
+        chain_audio, chain_video, added = _refine_bend(audio_desc_times, video_times, replace_mask,
+                                                       first, last, grid_seconds, trial / fps, attempt_rigid)
+        reason = _refine_refusal(audio_desc_times, video_times, first, last, chain_audio, chain_video, added)
+        if reason is None:
+          break
+      if reason is None:
+        # judge it at the anchors it was built from, around the stretch
+        around = np.arange(max(low - 2, 0), min(high + 3, len(grid)))
+        positions = around[anchor[around]]
+        if len(positions) == 0:
+          reason = "no anchors"
+        else:
+          new_audio, new_video = _refine_splice(audio_desc_times, video_times, first, last, chain_audio, chain_video)
+          trial_audio, trial_video = _refine_interpolable(new_audio * fps, new_video * fps)
+          after_scores, _ = _refine_scores(audio_features, video_features, trial_audio, trial_video, grid[positions])
+          after_lag, after_margin, _ = _refine_peaks(after_scores, lags)
+          reason = _refine_verdict(lag[positions], after_lag, after_margin)
+      if reason is not None:
+        report["refused"][reason] = report["refused"].get(reason, 0) + 1
+        continue
+      total = trial
+      rigid = attempt_rigid
+      report["bent"] += 1
+      report["bent_seconds"] += float((grid[high] - grid[low]) / fps)
+      report["max_correction_ms"] = max(report["max_correction_ms"], float(np.max(np.abs(attempt)) / fps * 1000))
+    if not np.any(total != 0):
+      _sync_add(final_tally, tally)
+      continue
+    chain_audio, chain_video, added = _refine_bend(audio_desc_times, video_times, replace_mask,
+                                                   first, last, grid_seconds, total / fps, rigid)
+    bent_chains.append((first, last, chain_audio, chain_video))
+  # assemble the bent chains into the map
+  refined_audio, refined_video = audio_desc_times, video_times
+  for first, last, chain_audio, chain_video in reversed(bent_chains):
+    refined_audio, refined_video = _refine_splice(refined_audio, refined_video, first, last, chain_audio, chain_video)
+  if bent_chains and _replaced_recording_samples(refined_audio, refined_video) \
+     != _replaced_recording_samples(audio_desc_times, video_times):
+    # every stretch was checked on its own; this should never happen, and if it
+    # does the map pass 2 made is the safe answer
+    report["refused"]["assembly"] = report["refused"].get("assembly", 0) + 1
+    report["bent"] = 0
+    bent_chains = []
+    refined_audio, refined_video = audio_desc_times, video_times
+    final_tally = dict(line_tally)
+  # measure the bent chains again on the map returned
+  if bent_chains:
+    final_audio, final_video = _refine_interpolable(refined_audio * fps, refined_video * fps)
+    bent_firsts = {first for first, _, _, _ in bent_chains}
+    for first, last, grid, lag, anchor in measured:
+      if first not in bent_firsts:
+        continue
+      scores, lags = _refine_scores(audio_features, video_features, final_audio, final_video, grid)
+      lag, _, anchor = _refine_peaks(scores, lags, _refine_path(scores, lags))
+      _sync_add(final_tally, _sync_tally(lag, anchor))
+  video_seconds = len(video_features) / fps
+  report["sync_check_line"] = sync_check_percentages(line_tally, video_seconds) if line_tally else None
+  report["sync_check"] = sync_check_percentages(final_tally, video_seconds) if final_tally else None
+  report["passthrough_ok"] = None
+  # nothing bent: would the constant offset that passthrough muxes measure as well?
+  if not bent_chains and measured and median_slope is not None:
+    slope = median_slope if .1 <= median_slope <= 10 else 1.
+    if is_passthrough_alignment(audio_desc_times, video_times, slope):
+      offset_frames = (video_times[0] - audio_desc_times[0]) * fps
+      constant_audio = np.array([0., float(len(audio_features))])
+      constant_video = constant_audio + offset_frames
+      line_lags, offset_lags, offset_margins = [], [], []
+      for _, _, grid, lag, anchor in measured:
+        positions = np.flatnonzero(anchor)
+        if len(positions) == 0:
+          continue
+        scores, lags = _refine_scores(audio_features, video_features, constant_audio, constant_video, grid[positions])
+        offset_lag, offset_margin, _ = _refine_peaks(scores, lags)
+        line_lags.append(lag[positions])
+        offset_lags.append(offset_lag)
+        offset_margins.append(offset_margin)
+      if line_lags:
+        ok, passthrough_tally = _refine_passthrough_verdict(
+            np.concatenate(line_lags), np.concatenate(offset_lags), np.concatenate(offset_margins))
+      else:
+        ok, passthrough_tally = False, {"anchors": 0, "within_40ms": 0, "over_120ms": 0}
+      report["passthrough_ok"] = ok
+      passthrough_tally["points"] = line_tally.get("points", 0)
+      report["sync_check_passthrough"] = sync_check_percentages(passthrough_tally, video_seconds)
+  return refined_audio, refined_video, report
+
+
+def align(video_features, audio_desc_features, video_energy, audio_desc_energy, refine=True,
+          refinement=None):
+  """
+  Map the recording onto the video: pass 1 matches hashed features, pass 2
+  pieces the map together from straight lines, and pass 3 (unless refine is
+  False) bends it where the recording's speed changes inside a line. Returns
+  (audio times, video times, similarity %, pass 2's path, median slope); when a
+  dict is given as refinement, pass 3's report is put in it.
+  """
   samples_per_node = 210 // TIMESTEPS_PER_SECOND
   hann_window_unnormed = scipy.signal.windows.hann(2*samples_per_node+1)[1:-1]
   hann_window = hann_window_unnormed / np.sum(hann_window_unnormed)
@@ -2259,13 +2995,20 @@ def align(video_features, audio_desc_features, video_energy, audio_desc_energy):
       x[-1] = x[-2] + ((y[-1] - y[-2]) / slope_end)
   
   path[:,:2] /= 210.
+  if refine:
+    print("  refining match: pass 3...      \r", end='')
+    x, y, report = refine_alignment(x, y, audio_desc_features_scaled, video_features_scaled, median_slope)
+  else:
+    report = {"applied": False}
+  if refinement is not None:
+    refinement.update(report)
   return x, y, similarity_percent, path, median_slope
 
 # combines videos with matching audio files (e.g. audio descriptions)
 # this is the main function of this script, it calls the other functions in order
 def combine(video, audio, stretch_audio=False, yes=False, prepend="ad_", no_pitch_correction=False,
             output_dir=default_output_dir, alignment_dir=default_alignment_dir, dry_run=False,
-            ad_language=None, audio_stream=0):
+            ad_language=None, audio_stream=0, no_refine=False):
   video_files, has_audio_extensions = get_sorted_filenames(video, VIDEO_EXTENSIONS, AUDIO_EXTENSIONS)
   
   if yes == False and sum(has_audio_extensions) > 0:
@@ -2373,8 +3116,10 @@ def combine(video, audio, stretch_audio=False, yes=False, prepend="ad_", no_pitc
     del audio_desc_arr
 
     _t = time.monotonic()
+    refinement = {}
     try:
-      outputs = align(video_features, audio_desc_features, video_energy, audio_desc_energy)
+      outputs = align(video_features, audio_desc_features, video_energy, audio_desc_energy,
+                      refine=not no_refine, refinement=refinement)
     except AlignmentMismatchError as err:
       # Persist the structured failure diagnosis next to where the success
       # report would have gone (<basename>.fail.json) so an automated consumer
@@ -2385,6 +3130,8 @@ def combine(video, audio, stretch_audio=False, yes=False, prepend="ad_", no_pitc
       raise
     audio_desc_times, video_times, similarity_percent, path, median_slope = outputs
     print(f"  aligned ({time.monotonic() - _t:.1f}s)          ")
+    for line in _refinement_summary(refinement):
+      print(f"  {line}")
     
     del video_energy, video_zero_crossings, video_freq_bands, video_features
     del audio_desc_energy, audio_desc_zero_crossings, audio_desc_freq_bands, audio_desc_features
@@ -2405,11 +3152,8 @@ def combine(video, audio, stretch_audio=False, yes=False, prepend="ad_", no_pitc
     # itsoffset. Saves the only audible quality step in the pipeline for
     # same-rate content.
     passthrough_offset = video_times[0] - audio_desc_times[0]
-    can_passthrough = (
-        stretch_audio
-        and not has_audio_extension
-        and is_passthrough_alignment(audio_desc_times, video_times, median_slope)
-    )
+    can_passthrough = _passthrough_decision(audio_desc_times, video_times, median_slope, stretch_audio,
+                                            has_audio_extension, refinement)
     # Use a sibling temp path so a crashed/interrupted ffmpeg run can't leave
     # a >100KB stub at output_filename that the skip-existing check upstream
     # would treat as success on the next run. Atomic-rename on success.
@@ -2589,7 +3333,8 @@ def combine(video, audio, stretch_audio=False, yes=False, prepend="ad_", no_pitc
     if PLOT_ALIGNMENT_TO_FILE:
       plot_filename_no_ext = os.path.join(alignment_dir, os.path.splitext(os.path.split(video_file)[1])[0])
       plot_alignment(plot_filename_no_ext, path, audio_desc_times, video_times, similarity_percent,
-                     median_slope, stretch_audio, no_pitch_correction)
+                     median_slope, stretch_audio, no_pitch_correction, refinement=refinement,
+                     passthrough=can_passthrough)
   print("All files processed.       ")
 
 if wx is not None:
@@ -3245,6 +3990,10 @@ def command_line_interface():
                       help='Which of the video\'s audio streams to align against and fill ' + \
                            'the description\'s gaps from, counting from 0. Default 0, the ' + \
                            'first. A release whose first track is a dub needs the original\'s.')
+  parser.add_argument('--no_refine', action='store_true',
+                      help="Skips pass 3, which bends the alignment where the description's speed "
+                           "changes inside one of pass 2's straight pieces (broadcast recordings "
+                           "with time compression). Gives version 2.2.8's alignment.")
   parser.add_argument('--watch', action='store_true',
                       help='Watch input directories for new file pairs and process them automatically.')
   parser.add_argument('--watch-interval', type=int, default=30, metavar='SECONDS',
@@ -3288,7 +4037,8 @@ def command_line_interface():
         try:
           combine(args.video, args.audio, args.stretch_audio, True, args.prepend,
                   args.no_pitch_correction, args.output_dir, args.alignment_dir, args.dry_run,
-                  ad_language=args.ad_language, audio_stream=args.audio_stream)
+                  ad_language=args.ad_language, audio_stream=args.audio_stream,
+                  no_refine=args.no_refine)
         except KeyboardInterrupt:
           print("\nWatch mode stopped.")
           break
@@ -3299,7 +4049,8 @@ def command_line_interface():
     else:
       combine(args.video, args.audio, args.stretch_audio, args.yes, args.prepend,
               args.no_pitch_correction, args.output_dir, args.alignment_dir, args.dry_run,
-              ad_language=args.ad_language, audio_stream=args.audio_stream)
+              ad_language=args.ad_language, audio_stream=args.audio_stream,
+              no_refine=args.no_refine)
   else:
     parser.print_usage()
 
