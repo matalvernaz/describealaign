@@ -238,8 +238,142 @@ def is_passthrough_alignment(audio_desc_times, video_times, median_slope,
   return True
 
 
+# Passthrough copies the recording in whole at one offset, so the description
+# track starts and stops where the recording does. A recording that starts late
+# or stops early leaves the track short of the video's own sound, and a player
+# ends the file when the track it is playing ends (Captain Underpants, checked
+# 2026-11-11: 37 of 39 episodes' description tracks stopped 53 s early, and an
+# episode never moved on to the next). The render path fills those ends from
+# the video's own sound instead. This much is allowed at each end.
+PASSTHROUGH_MAX_END_GAP_SECONDS = 1.0
+# How far the copied stream's stored timing may differ from the sound the
+# alignment read: a copy that plays this much off puts the narration this much
+# off the picture for the whole file. Measured on real recordings 2026-11-25
+# (AudioVault and LivingAudio MP3s, iPlayer M4As): a lead of at most 25 ms
+# (one MP3 frame of encoder delay), a span at most 57 ms from the decoded
+# length, and no jump between packets.
+PASSTHROUGH_MAX_TIMING_SKEW_SECONDS = 0.1
+# A whole recording's packets read in seconds on a local disk; this only stops
+# a read that has hung.
+COPIED_SPAN_READ_TIMEOUT_SECONDS = 600
+
+
+def _passthrough_end_gaps(audio_desc_times, video_times, copy_lead, copy_span, video_audio_seconds):
+  """
+  How far a passthrough description track would start after, and stop
+  before, the video's own sound, in seconds; negative where it overhangs.
+
+  Passthrough places the recording's file at video_times[0] -
+  audio_desc_times[0] (write_passthrough_media_to_disk delays whichever input
+  starts first), and the copied stream plays *copy_lead* after its file's
+  start for *copy_span* (see _copied_stream_span). So the gap at the start is
+  that offset plus the lead, and the gap at the end is what is left of the
+  video's sound after the offset, the lead and the span.
+  """
+  offset = video_times[0] - audio_desc_times[0]
+  start_gap = offset + copy_lead
+  end_gap = video_audio_seconds - offset - copy_lead - copy_span
+  return start_gap, end_gap
+
+
+def _copied_stream_span(audio_desc_file):
+  """
+  (lead, span, drift) of the recording's first audio stream, the one
+  passthrough copies, read from its packets on its file's own timeline: how
+  long after the file's start its first packet plays, how long from there to
+  the end of its last packet, and the furthest its stored timing strays from
+  running on packet by packet (a single step between one packet's end and the
+  next one's start, or many small ones added up), in seconds. None when they
+  cannot be read.
+
+  ffmpeg moves each input to start at 0 before muxing, so a stream that
+  starts later than its file keeps that delay in the output. Packets are
+  read as a stream of lines and only the earliest start and latest end
+  kept, so a long recording costs no memory.
+  """
+  try:
+    probe = ffmpeg.probe(audio_desc_file, cmd=get_ffprobe())
+    file_start = float(probe['format'].get('start_time') or 0.0)
+  except (ffmpeg.Error, ValueError, KeyError, TypeError, OSError):
+    return None
+  command = [get_ffprobe(), '-v', 'error', '-select_streams', 'a:0',
+             '-show_entries', 'packet=pts_time,duration_time', '-of', 'csv=p=0', audio_desc_file]
+  try:
+    reader = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+  except OSError:
+    return None
+  # A read that hangs (a stalled network share) is stopped rather than holding up the run.
+  watchdog = threading.Timer(COPIED_SPAN_READ_TIMEOUT_SECONDS, reader.kill)
+  watchdog.start()
+  try:
+    return _read_copied_span(reader, file_start)
+  finally:
+    watchdog.cancel()
+    if reader.poll() is None:
+      reader.kill()
+      reader.wait()
+
+
+def _read_copied_span(reader, file_start):
+  """_copied_stream_span's reading of ffprobe's packet lines from *reader*."""
+  first_start = None
+  last_end = None
+  expected_next = None
+  # How far the stored timing has moved from running on packet by packet, in
+  # total so far, and the furthest it has been: sixty 20 ms gaps that sixty
+  # 20 ms overlaps later undo leave the ends right and the middle 1.2 s off.
+  accumulated = 0.0
+  drift = 0.0
+  # Each line is "pts_time,duration_time"; ffprobe prints them in that order.
+  for line in reader.stdout:
+    fields = line.strip().split(',')
+    try:
+      start = float(fields[0])
+    except (ValueError, IndexError):
+      continue
+    try:
+      length = float(fields[1])
+    except (ValueError, IndexError):
+      length = 0.0
+    if not (np.isfinite(start) and np.isfinite(length)):
+      continue
+    if expected_next is not None:
+      step = start - expected_next
+      accumulated += step
+      drift = max(drift, abs(step), abs(accumulated))
+    expected_next = start + length
+    first_start = start if first_start is None else min(first_start, start)
+    last_end = start + length if last_end is None else max(last_end, start + length)
+  if reader.wait() != 0 or first_start is None:
+    return None
+  return first_start - file_start, last_end - first_start, drift
+
+
+def _copy_matches_decode(copied_span, recording_seconds):
+  """
+  Whether passthrough's copy of the recording would play the way it was
+  aligned. The alignment reads the recording's samples from its first one,
+  ignoring the stored timestamps (damaged ones in broadcast-rip MP3s are why);
+  the copy keeps them. So the copied stream must start with its file (one
+  stored with a delay, like an .mka whose first track begins 5 s in, comes
+  out that late) and its stored span must match its decoded length
+  (timestamps that stall or stretch move the copy against the alignment), and
+  its stored timing must never stray from running on packet by packet (a
+  jump, or small slips adding up, even ones undone later, puts everything in
+  between off), each within PASSTHROUGH_MAX_TIMING_SKEW_SECONDS. A span that
+  could not be read (*copied_span* None) does not match.
+  """
+  if copied_span is None:
+    return False
+  lead, span, drift = copied_span
+  return (abs(lead) <= PASSTHROUGH_MAX_TIMING_SKEW_SECONDS
+          and abs(span - recording_seconds) <= PASSTHROUGH_MAX_TIMING_SKEW_SECONDS
+          and drift <= PASSTHROUGH_MAX_TIMING_SKEW_SECONDS)
+
+
 def _passthrough_decision(audio_desc_times, video_times, median_slope, stretch_audio,
-                          has_audio_extension, refinement=None):
+                          has_audio_extension, refinement=None, recording_seconds=None,
+                          video_audio_seconds=None, copied_span=None):
   """
   Whether combine() muxes the recording untouched at one constant offset.
 
@@ -250,11 +384,25 @@ def _passthrough_decision(audio_desc_times, video_times, median_slope, stretch_a
   ran, passthrough also needs nothing bent and the constant-offset map measured
   no worse than the map itself (refinement["passthrough_ok"], set by align()).
   With pass 3 off, or with nothing it could measure, the decision is 2.2.8's.
+  Given both lengths (*recording_seconds*, the recording's decoded length,
+  and *video_audio_seconds*, the video's own sound's), it also needs the
+  copied stream (*copied_span*, from _copied_stream_span) to play the way it
+  was aligned (_copy_matches_decode) and to reach both ends of the video's
+  sound within PASSTHROUGH_MAX_END_GAP_SECONDS, measured from the copy's own
+  bounds so the two allowances do not add up (_passthrough_end_gaps).
   """
   if not stretch_audio or has_audio_extension:
     return False
   if not is_passthrough_alignment(audio_desc_times, video_times, median_slope):
     return False
+  if recording_seconds is not None and video_audio_seconds is not None:
+    if not _copy_matches_decode(copied_span, recording_seconds):
+      return False
+    lead, span, _ = copied_span
+    start_gap, end_gap = _passthrough_end_gaps(audio_desc_times, video_times, lead, span,
+                                               video_audio_seconds)
+    if start_gap > PASSTHROUGH_MAX_END_GAP_SECONDS or end_gap > PASSTHROUGH_MAX_END_GAP_SECONDS:
+      return False
   if not refinement or not refinement.get("applied"):
     return True
   if refinement.get("bent", 0):
@@ -3084,6 +3232,7 @@ def combine(video, audio, stretch_audio=False, yes=False, prepend="ad_", no_pitc
     _t = time.monotonic()
     print("  reading video file...\r", end='')
     video_arr = parse_audio_from_file(video_file, num_channels, audio_stream=audio_stream)
+    video_audio_seconds = video_arr.shape[1] / AUDIO_SAMPLE_RATE
     print(f"  read video ({time.monotonic() - _t:.1f}s)          ")
 
     _t = time.monotonic()
@@ -3103,6 +3252,7 @@ def combine(video, audio, stretch_audio=False, yes=False, prepend="ad_", no_pitc
     # damaged PTS otherwise get silence-stuffed into a multiple of their real
     # length by the async resampler, poisoning the alignment.
     audio_desc_arr = parse_audio_from_file(audio_desc_file, num_channels, honor_pts=False)
+    recording_seconds = audio_desc_arr.shape[1] / AUDIO_SAMPLE_RATE
     print(f"  read audio ({time.monotonic() - _t:.1f}s)          ")
 
     _t = time.monotonic()
@@ -3152,8 +3302,26 @@ def combine(video, audio, stretch_audio=False, yes=False, prepend="ad_", no_pitc
     # itsoffset. Saves the only audible quality step in the pipeline for
     # same-rate content.
     passthrough_offset = video_times[0] - audio_desc_times[0]
+    # The map's shape first (cheap); only a recording that could pass through
+    # has its stored timing read, and both are then judged on that copy.
     can_passthrough = _passthrough_decision(audio_desc_times, video_times, median_slope, stretch_audio,
                                             has_audio_extension, refinement)
+    if can_passthrough:
+      copied_span = _copied_stream_span(audio_desc_file)
+      can_passthrough = _passthrough_decision(audio_desc_times, video_times, median_slope, stretch_audio,
+                                              has_audio_extension, refinement,
+                                              recording_seconds=recording_seconds,
+                                              video_audio_seconds=video_audio_seconds,
+                                              copied_span=copied_span)
+      if not can_passthrough:
+        if not _copy_matches_decode(copied_span, recording_seconds):
+          print(f"  rendering, not passing the recording through: its stored timing "
+                f"(lead, span, drift) {copied_span} does not match its {recording_seconds:.1f}s of sound")
+        else:
+          start_gap, end_gap = _passthrough_end_gaps(audio_desc_times, video_times, copied_span[0],
+                                                     copied_span[1], video_audio_seconds)
+          print(f"  rendering, not passing the recording through: it would start {start_gap:.1f}s "
+                f"after and stop {end_gap:.1f}s before the video's own sound")
     # Use a sibling temp path so a crashed/interrupted ffmpeg run can't leave
     # a >100KB stub at output_filename that the skip-existing check upstream
     # would treat as success on the next run. Atomic-rename on success.
